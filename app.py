@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 import psycopg2
+from psycopg2 import pool as pg_pool
 from flask import Flask, request, jsonify, Response
 
 # ==========================================
@@ -68,17 +69,28 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024  # 업로드 이미지 등 요청 본문 최대 12MB
 
 
+# 📌 요청마다 psycopg2.connect()로 새 TCP+TLS 연결을 맺으면(예전 방식) Supabase까지
+#    매번 왕복이 생겨서 그만큼 응답이 느려집니다. 프로세스 안에 커넥션을 미리 몇 개
+#    만들어두고 재사용하는 커넥션 풀을 쓰면 이 지연을 없앨 수 있습니다.
+#    (Supabase의 "Connection Pooling" 접속 문자열(6543 포트, Transaction 모드)을
+#     DATABASE_URL로 쓰는 건 여전히 권장됩니다.)
+DB_POOL = pg_pool.ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode="require")
+
+
 @contextmanager
 def db_cursor(commit=False):
-    """요청마다 새 커넥션을 열고 끝나면 반드시 닫는다 (Supabase pooler와 궁합이 좋음)."""
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    """풀에서 커넥션을 빌려 쓰고, 끝나면(실패해도) 반드시 풀에 반납한다."""
+    conn = DB_POOL.getconn()
     try:
         cur = conn.cursor()
         yield cur
         if commit:
             conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        DB_POOL.putconn(conn)
 
 
 def init_db():
@@ -354,7 +366,8 @@ def get_home_summary_py():
         studies = fetch_category("WHERE gallery = 'study'")
         overseas = fetch_category("WHERE gallery = 'overseas_fb'")
         recents = fetch_category("WHERE gallery = 'all'")
-        return {"success": True, "concepts": concepts, "studies": studies, "overseas": overseas, "recents": recents}
+        notices = fetch_category("WHERE gallery = 'admin_notice'")
+        return {"success": True, "concepts": concepts, "studies": studies, "overseas": overseas, "recents": recents, "notices": notices}
     except Exception as e:
         return {"success": False, "msg": str(e)}
 
@@ -876,12 +889,21 @@ HTML_PAGE = """
       <!-- 홈 화면 -->
       <div id="view-home">
         <div class="home-grid">
-          <div class="home-card">
+          <!-- 📌 인기글이 홈 화면에서 가장 눈에 띄어야 해서 전체 폭을 차지하는 카드로
+               올리고, 대신 전체 최신글은 아래쪽의 일반 크기 카드로 내렸습니다. -->
+          <div class="home-card home-card-full">
             <div class="home-card-header">
               <span>🔥 인기글</span>
               <span style="font-size:9px; cursor:pointer;" onclick="switchGallery('concept')">더보기+</span>
             </div>
             <ul id="home-concept-list" class="home-list"></ul>
+          </div>
+          <div class="home-card">
+            <div class="home-card-header">
+              <span>📢 관리자 공지사항</span>
+              <span style="font-size:9px; cursor:pointer;" onclick="switchGallery('admin_notice')">더보기+</span>
+            </div>
+            <ul id="home-notice-list" class="home-list"></ul>
           </div>
           <div class="home-card">
             <div class="home-card-header">
@@ -904,7 +926,7 @@ HTML_PAGE = """
             </div>
             <ul id="home-overseas-list" class="home-list"></ul>
           </div>
-          <div class="home-card home-card-full">
+          <div class="home-card">
             <div class="home-card-header">
               <span>🌐 전체 최신글</span>
               <span style="font-size:9px; cursor:pointer;" onclick="switchGallery('all')">더보기+</span>
@@ -1423,7 +1445,7 @@ HTML_PAGE = """
   }
   function loadHomeSummary() {
     // 📌 서버 응답을 기다리는 동안 화면이 멈춘 것처럼 보이지 않도록 즉시 로딩 표시를 띄웁니다.
-    ['home-concept-list', 'home-study-list', 'home-overseas-list', 'home-recent-list', 'home-dating-list'].forEach(id => {
+    ['home-concept-list', 'home-notice-list', 'home-study-list', 'home-overseas-list', 'home-recent-list', 'home-dating-list'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.innerHTML = '<li style="color:#888;">불러오는 중...</li>';
     });
@@ -1431,6 +1453,7 @@ HTML_PAGE = """
       const res = parseRes(obj);
       if (res.success) {
         renderHomeList('home-concept-list', res.concepts);
+        renderHomeList('home-notice-list', res.notices);
         renderHomeList('home-study-list', res.studies);
         renderHomeList('home-overseas-list', res.overseas);
         renderHomeList('home-recent-list', res.recents);
