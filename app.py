@@ -158,6 +158,15 @@ def init_db():
             c.execute(f"ALTER TABLE comments ADD COLUMN IF NOT EXISTS {col} {coltype}")
         # 📌 관리자 권한은 이메일 인증 계정이 아닌 별도의 관리자 로그인(ADMIN_LOGIN_ID)으로만 부여됩니다.
         c.execute("UPDATE users SET is_admin = 0")
+        # 📌 글/댓글이 쌓일수록 gallery, is_concept로 걸러내거나 댓글 수를 세는 쿼리가
+        #    인덱스 없이는 매번 테이블 전체를 훑게 되어 점점 느려집니다. 특히
+        #    "(SELECT COUNT(*) FROM comments WHERE post_id = posts.id)" 형태의
+        #    서브쿼리는 게시글 목록을 보여줄 때마다 각 글에 대해 반복 실행되므로,
+        #    comments.post_id 인덱스가 없으면 글이 많아질수록 눈에 띄게 느려집니다.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_posts_gallery ON posts(gallery)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_posts_is_concept ON posts(is_concept)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_posts_author_id ON posts(author_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)")
 
 
 init_db()
@@ -590,6 +599,33 @@ def report_item_py(target_type, target_id, reason="사용자 신고"):
 def _args():
     data = request.get_json(silent=True)
     return data if isinstance(data, list) else []
+
+
+# 📌 게시글에 사진이 들어가면 base64 문자열이 JSON 응답에 그대로 실려서 응답 용량이
+#    꽤 커집니다(원본 이미지보다 약 33% 더 큼). gzip으로 압축해서 보내면 전송량이
+#    많이 줄어들어 목록/상세를 열 때 체감 속도가 빨라집니다. 새 패키지 설치 없이
+#    파이썬 표준 라이브러리 gzip만으로 처리합니다.
+import gzip as _gzip
+
+
+@app.after_request
+def _compress_response(response):
+    accept_encoding = request.headers.get('Accept-Encoding', '')
+    if (
+        'gzip' not in accept_encoding.lower()
+        or response.direct_passthrough
+        or response.status_code < 200
+        or response.status_code >= 300
+        or 'Content-Encoding' in response.headers
+        or response.content_length is None
+        or response.content_length < 500
+    ):
+        return response
+    response.set_data(_gzip.compress(response.get_data(), compresslevel=6))
+    response.headers['Content-Encoding'] = 'gzip'
+    response.headers['Content-Length'] = len(response.get_data())
+    response.headers.setdefault('Vary', 'Accept-Encoding')
+    return response
 
 
 @app.route('/api/send_email', methods=['POST'])
