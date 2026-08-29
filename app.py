@@ -704,34 +704,37 @@ HTML_PAGE = """
     * { box-sizing: border-box; letter-spacing: -0.3px; }
     html, body { height: 100%; margin: 0; padding: 0; background: #f2f2f2; font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', '돋움', Dotum, sans-serif; }
     .dc-wrapper { width: 100%; height: 100vh; display: flex; flex-direction: column; background: #fff; }
-    .dc-header { background: #3b4890; color: white; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+    .dc-header { background: #3e4887; color: white; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
     .dc-header h1 { margin: 0; font-size: 15px; cursor: pointer; color: #ffffff; }
     .dc-header-right { display: flex; align-items: center; gap: 8px; }
-    .dc-clock { font-size: 12px; background: #2b3467; color: #2ee6b5; padding: 3px 9px; border-radius: 3px; font-weight: bold; }
-    .dc-header span.gal-tag { font-size: 10px; background: #2b3467; padding: 2px 6px; border-radius: 3px; }
-    .nav-tabs { display: flex; background: #2b3467; flex-shrink: 0; overflow-x: auto; }
+    .dc-clock { font-size: 12px; background: #2d3461; color: #2ee6b5; padding: 3px 9px; border-radius: 3px; font-weight: bold; }
+    .dc-header span.gal-tag { font-size: 10px; background: #2d3461; padding: 2px 6px; border-radius: 3px; }
+    .nav-tabs { display: flex; background: #2d3461; flex-shrink: 0; overflow-x: auto; }
     .nav-tab { flex: 1; text-align: center; padding: 8px 4px; color: #ccc; font-size: 11px; font-weight: bold; cursor: pointer; white-space: nowrap; min-width: 55px; }
-    .nav-tab.active { background: #fff; color: #3b4890; }
+    .nav-tab.active { background: #fff; color: #3e4887; }
     .nav-tab.lock::after { content: ' 🔒'; font-size: 9px; }
     .dc-main-layout { display: flex; flex: 1; overflow: hidden; }
     .dc-sponsor-col { width: 220px; background: #f8f9fa; padding: 8px; flex-shrink: 0; border-right: 1px solid #d1d1d1; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
     .ad-banner-box { border: 1px dashed #94a3b8; border-radius: 3px; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 10px; color: #94a3b8; background: #f1f5f9; line-height: 1.5; overflow: hidden; }
-    .ad-banner-box img { width: 100%; display: block; }
-    .ad-banner-box-1 { min-height: 300px; }
-    .ad-banner-box-2 { min-height: 140px; }
+    .ad-banner-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    /* 📌 화면이 브라우저 창 전체 높이를 채우게 되면서 광고란 두 개만으로는 옆 칸이
+       다 안 채워져 아래에 빈 여백이 크게 남았습니다. flex로 남는 세로 공간을
+       두 광고란이 2:1 비율로 나눠 채우도록 해서 여백이 남지 않게 합니다. */
+    .ad-banner-box-1 { min-height: 300px; flex: 2 1 auto; }
+    .ad-banner-box-2 { min-height: 140px; flex: 1 1 auto; }
     .dc-content { flex: 1; overflow-y: auto; padding: 10px; border-right: 1px solid #ddd; }
     .dc-sidebar { width: 210px; background: #f8f9fa; padding: 8px; flex-shrink: 0; border-left: 1px solid #d1d1d1; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
     .dc-box { border: 1px solid #d1d1d1; background: #fff; padding: 8px; }
-    .dc-title { font-size: 11px; font-weight: bold; color: #3b4890; margin-bottom: 6px; border-bottom: 1px solid #3b4890; padding-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
+    .dc-title { font-size: 11px; font-weight: bold; color: #3e4887; margin-bottom: 6px; border-bottom: 1px solid #3e4887; padding-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
     .input-row { display: flex; gap: 4px; margin-bottom: 4px; }
     input, textarea, select { padding: 4px 6px; border: 1px solid #ccc; font-size: 11px; font-family: inherit; }
     input.auth-input { width: 50%; }
     input.full-input { width: 100%; margin-bottom: 4px; }
     textarea { width: 100%; height: 48px; resize: none; margin-bottom: 4px; line-height: 1.4; }
-    .dc-btn { padding: 4px 8px; background: #3b4890; color: white; border: none; font-size: 11px; font-weight: bold; cursor: pointer; border-radius: 2px; }
+    .dc-btn { padding: 4px 8px; background: #3e4887; color: white; border: none; font-size: 11px; font-weight: bold; cursor: pointer; border-radius: 2px; }
     .dc-btn:disabled { background: #888 !important; cursor: not-allowed; }
-    .dc-btn-write { background: #3b4890; width: 100%; padding: 6px; }
-    .dc-btn-open-write { background: #3b4890; font-size: 11px; padding: 5px 12px; white-space: nowrap; }
+    .dc-btn-write { background: #3e4887; width: 100%; padding: 6px; }
+    .dc-btn-open-write { background: #3e4887; font-size: 11px; padding: 5px 12px; white-space: nowrap; }
     .dc-btn-danger { background: #e74c3c; }
     .dc-btn-delete { background: #555; }
     .btn-compact { font-size: 10px; padding: 2px 6px; }
@@ -740,7 +743,7 @@ HTML_PAGE = """
     .hidden { display: none !important; }
     /* 📌 텍스트 규격 및 테이블 최적화 */
     .dc-table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: center; table-layout: fixed; }
-    .dc-table th { background: #f2f2f2; border-top: 1px solid #3b4890; border-bottom: 1px solid #ddd; padding: 6px 2px; }
+    .dc-table th { background: #f2f2f2; border-top: 1px solid #3e4887; border-bottom: 1px solid #ddd; padding: 6px 2px; }
     .dc-table td { border-bottom: 1px solid #eee; padding: 6px 2px; color: #444; }
     .dc-table .title-td { text-align: left; padding-left: 4px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; word-break: break-all; }
     .badge-gal { background: #7f8c8d; color: white; font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-right: 2px; font-weight: normal; }
@@ -751,22 +754,22 @@ HTML_PAGE = """
     .home-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .home-card { border: 1px solid #cbd5e1; background: #fff; padding: 6px; border-radius: 3px; }
     .home-card-full { grid-column: 1 / -1; }
-    .home-card-header { font-size: 11px; font-weight: bold; color: #3b4890; border-bottom: 1.5px solid #3b4890; padding-bottom: 3px; margin-bottom: 4px; display: flex; justify-content: space-between; }
+    .home-card-header { font-size: 11px; font-weight: bold; color: #3e4887; border-bottom: 1.5px solid #3e4887; padding-bottom: 3px; margin-bottom: 4px; display: flex; justify-content: space-between; }
     .home-list { list-style: none; padding: 0; margin: 0; font-size: 11px; }
     .home-list li { padding: 4px 0; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; cursor: pointer; word-break: break-all; }
     /* 📌 게시글 및 댓글 텍스트 줄바꿈 / 자간 / 정렬 규격 개선 */
-    .post-view { border: 1px solid #3b4890; background: #fff; padding: 10px; margin-bottom: 8px; }
+    .post-view { border: 1px solid #3e4887; background: #fff; padding: 10px; margin-bottom: 8px; }
     .post-view-header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px dashed #ccc; padding-bottom: 6px; }
-    .post-view-title { font-size: 13px; font-weight: bold; color: #3b4890; word-break: keep-all; word-wrap: break-word; line-height: 1.4; }
+    .post-view-title { font-size: 13px; font-weight: bold; color: #3e4887; word-break: keep-all; word-wrap: break-word; line-height: 1.4; }
     .post-view-meta { font-size: 10px; color: #888; margin: 4px 0 8px 0; }
     .post-view-content { font-size: 12px; line-height: 1.6; color: #222; min-height: 50px; white-space: pre-wrap; word-break: keep-all; word-wrap: break-word; overflow-wrap: break-word; margin-bottom: 10px; }
     .post-img { max-width: 100%; max-height: 260px; display: block; margin: 8px 0; border: 1px solid #ddd; }
     .vote-box { display: flex; justify-content: center; gap: 8px; margin: 10px 0; }
     .btn-vote { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 52px; height: 38px; border: 1px solid #ccc; background: #fdfdfd; cursor: pointer; border-radius: 4px; font-size: 10px; }
-    .btn-vote.up { border-color: #3b4890; color: #3b4890; }
+    .btn-vote.up { border-color: #3e4887; color: #3e4887; }
     .btn-vote:disabled { opacity: 0.5; cursor: not-allowed; }
     /* 📌 댓글 영역 텍스트 및 간격 핏 조율 */
-    .comment-section { border-top: 1px solid #3b4890; padding-top: 6px; background: #fafafa; padding: 8px; }
+    .comment-section { border-top: 1px solid #3e4887; padding-top: 6px; background: #fafafa; padding: 8px; }
     .comment-list { list-style: none; padding: 0; margin: 0 0 8px 0; }
     .comment-item { border-bottom: 1px solid #e5e7eb; padding: 5px 0; font-size: 11px; display: flex; justify-content: space-between; line-height: 1.4; }
     .comment-body { word-break: keep-all; word-wrap: break-word; overflow-wrap: break-word; white-space: pre-wrap; margin-top: 2px; color: #333; }
@@ -774,12 +777,12 @@ HTML_PAGE = """
     .toolbar-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; }
     .search-box { display: flex; gap: 2px; flex: 1; }
     .search-input { width: 100%; padding: 3px 6px; font-size: 10px; }
-    .sort-select { padding: 2px 4px; font-size: 10px; border: 1px solid #3b4890; background: #fff; color: #3b4890; font-weight: bold; }
-    .status-badge { font-size: 10px; padding: 3px 6px; background: #eef2ff; color: #3b4890; border: 1px solid #3b4890; border-radius: 3px; margin-bottom: 6px; text-align: center; }
+    .sort-select { padding: 2px 4px; font-size: 10px; border: 1px solid #3e4887; background: #fff; color: #3e4887; font-weight: bold; }
+    .status-badge { font-size: 10px; padding: 3px 6px; background: #eef2ff; color: #3e4887; border: 1px solid #3e4887; border-radius: 3px; margin-bottom: 6px; text-align: center; }
     .notice-box-text { font-size: 11px; color: #555; line-height: 1.5; }
     /* 모달 모듈 (관리자 요청) */
     .modal-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-    .modal-box { background: #fff; border: 2px solid #3b4890; width: 320px; padding: 12px; border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }
+    .modal-box { background: #fff; border: 2px solid #3e4887; width: 320px; padding: 12px; border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }
   </style>
 </head>
 <body>
@@ -815,7 +818,7 @@ HTML_PAGE = """
       <!-- 📌 관리자 전용 광고란 1 이미지 등록 -->
       <div id="ad-admin-upload-1" class="hidden">
         <input type="file" id="ad-file-1" accept="image/*" style="font-size:9px; width:100%; margin-bottom:4px;">
-        <button class="dc-btn" style="width:100%; background:#3b4890;" onclick="uploadAdBanner(1)">광고란 1에 등록</button>
+        <button class="dc-btn" style="width:100%; background:#3e4887;" onclick="uploadAdBanner(1)">광고란 1에 등록</button>
       </div>
       <div class="dc-title" style="margin-bottom:2px; margin-top:6px;">📣 광고란 2</div>
       <div id="ad-banner-box-2" class="ad-banner-box ad-banner-box-2">
@@ -825,7 +828,7 @@ HTML_PAGE = """
       <!-- 📌 관리자 전용 광고란 2 이미지 등록 -->
       <div id="ad-admin-upload-2" class="hidden">
         <input type="file" id="ad-file-2" accept="image/*" style="font-size:9px; width:100%; margin-bottom:4px;">
-        <button class="dc-btn" style="width:100%; background:#3b4890;" onclick="uploadAdBanner(2)">광고란 2에 등록</button>
+        <button class="dc-btn" style="width:100%; background:#3e4887;" onclick="uploadAdBanner(2)">광고란 2에 등록</button>
       </div>
     </div>
     <div class="dc-content">
@@ -848,7 +851,7 @@ HTML_PAGE = """
           <button class="btn-vote down" onclick="vote('down')">👎 비추 <span id="down-count">0</span></button>
         </div>
         <div class="comment-section">
-          <div style="font-size:11px; font-weight:bold; color:#3b4890; margin-bottom:4px;">💬 댓글</div>
+          <div style="font-size:11px; font-weight:bold; color:#3e4887; margin-bottom:4px;">💬 댓글</div>
           <div id="comment-list" class="comment-list"></div>
           <div id="comment-login-notice" class="status-badge hidden">🔒 댓글 작성은 로그인 후 이용 가능합니다.</div>
           <div id="comment-write-area">
