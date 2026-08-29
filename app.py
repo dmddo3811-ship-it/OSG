@@ -353,8 +353,13 @@ def get_posts_py(tab_type='all', sort_type='date', gallery_type='all', search_kw
 
 
 def get_home_summary_py():
+    # 📌 예전에는 홈 화면 카드마다(인기글/학습/해외축구/전체/공지/여소남소) DB
+    #    커넥션을 따로따로 빌려서 총 6번 왕복했고, 프론트에서도 API를 2번(홈 요약 +
+    #    여소남소용 get_posts) 나눠서 호출했습니다. 이 왕복 횟수가 홈 화면이 유독
+    #    느리게 느껴진 주된 원인이라, 커넥션 하나로 6개 쿼리를 전부 처리하고
+    #    프론트도 API를 1번만 부르도록 합쳤습니다.
     try:
-        def fetch_category(where_sql, limit=4):
+        def fetch_category(c, where_sql, limit=4):
             q = f"""
             SELECT id, title, author, created_at,
                    (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) AS comment_count,
@@ -362,21 +367,22 @@ def get_home_summary_py():
                    ROW_NUMBER() OVER (PARTITION BY gallery ORDER BY id ASC) AS local_id
             FROM posts {where_sql} ORDER BY id DESC LIMIT {limit}
             """
-            with db_cursor() as c:
-                c.execute(q)
-                rows = c.fetchall()
+            c.execute(q)
+            rows = c.fetchall()
             res = []
             for r in rows:
                 try: d = datetime.strptime(r[3], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
                 except Exception: d = r[3]
                 res.append({"id": r[0], "title": r[1], "author": r[2], "date": d, "comment_count": r[4], "upvotes": r[5], "is_concept": r[6], "gallery": r[7], "local_id": r[8]})
             return res
-        concepts = fetch_category("WHERE is_concept = 1")
-        studies = fetch_category("WHERE gallery = 'study'")
-        overseas = fetch_category("WHERE gallery = 'overseas_fb'")
-        recents = fetch_category("WHERE gallery = 'all'")
-        notices = fetch_category("WHERE gallery = 'admin_notice'")
-        return {"success": True, "concepts": concepts, "studies": studies, "overseas": overseas, "recents": recents, "notices": notices}
+        with db_cursor() as c:
+            concepts = fetch_category(c, "WHERE is_concept = 1")
+            studies = fetch_category(c, "WHERE gallery = 'study'")
+            overseas = fetch_category(c, "WHERE gallery = 'overseas_fb'")
+            recents = fetch_category(c, "WHERE gallery = 'all'")
+            notices = fetch_category(c, "WHERE gallery = 'admin_notice'")
+            datings = fetch_category(c, "WHERE gallery = 'dating'")
+        return {"success": True, "concepts": concepts, "studies": studies, "overseas": overseas, "recents": recents, "notices": notices, "datings": datings}
     except Exception as e:
         return {"success": False, "msg": str(e)}
 
@@ -781,6 +787,10 @@ HTML_PAGE = """
     .ad-banner-box-2 { min-height: 140px; flex: 1 1 auto; }
     .dc-content { flex: 1; overflow-y: auto; padding: 10px; border-right: 1px solid #ddd; }
     .dc-sidebar { width: 210px; background: #f8f9fa; padding: 8px; flex-shrink: 0; border-left: 1px solid #d1d1d1; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+    /* 📌 우측 사이드바(로그인/학생정보/관리자센터/공지사항)가 화면 높이를 다 못
+       채워서 아래쪽에 빈 공간이 남았습니다. 광고란 3을 넣고 flex로 남는 세로
+       공간을 채우도록 합니다. */
+    .ad-banner-box-3 { min-height: 160px; flex: 1 1 auto; }
     .dc-box { border: 1px solid #d1d1d1; background: #fff; padding: 8px; }
     .dc-title { font-size: 11px; font-weight: bold; color: #534884; margin-bottom: 6px; border-bottom: 1px solid #534884; padding-bottom: 3px; display: flex; justify-content: space-between; align-items: center; }
     .input-row { display: flex; gap: 4px; margin-bottom: 4px; }
@@ -925,8 +935,9 @@ HTML_PAGE = """
       <!-- 홈 화면 -->
       <div id="view-home">
         <div class="home-grid">
-          <!-- 📌 인기글이 홈 화면에서 가장 눈에 띄어야 해서 전체 폭을 차지하는 카드로
-               올리고, 대신 전체 최신글은 아래쪽의 일반 크기 카드로 내렸습니다. -->
+          <!-- 📌 인기글과 관리자 공지사항은 전체 폭을 차지하는 카드로 위쪽에 두고,
+               나머지 4개(여소남소/학습/해외축구/전체 최신글)는 2x2로 딱 맞아떨어지게
+               배치해서 혼자 남는 어중간한 자리가 생기지 않도록 했습니다. -->
           <div class="home-card home-card-full">
             <div class="home-card-header">
               <span>🔥 인기글</span>
@@ -934,7 +945,7 @@ HTML_PAGE = """
             </div>
             <ul id="home-concept-list" class="home-list"></ul>
           </div>
-          <div class="home-card">
+          <div class="home-card home-card-full">
             <div class="home-card-header">
               <span>📢 관리자 공지사항</span>
               <span style="font-size:9px; cursor:pointer;" onclick="switchGallery('admin_notice')">더보기+</span>
@@ -1078,6 +1089,17 @@ HTML_PAGE = """
       <div class="dc-box" style="border-color:#f39c12;">
         <div class="dc-title" style="color:#f39c12; border-color:#f39c12;">📢 관리자 공지사항</div>
         <div class="notice-box-text">교칙에 위배되는 글 및 사진 게시 시 학번 이름 공개 및 제재를 할 것입니다.</div>
+      </div>
+      <!-- 📌 우측 사이드바 하단 빈 공간을 채우는 광고란 3 -->
+      <div class="dc-title" style="margin-bottom:2px;">📣 광고란 3</div>
+      <div id="ad-banner-box-3" class="ad-banner-box ad-banner-box-3">
+        <div id="ad-banner-placeholder-3">광고 이미지 없음<br>광고 관련 문의는 관리자에게</div>
+        <img id="ad-banner-img-3" class="hidden">
+      </div>
+      <!-- 📌 관리자 전용 광고란 3 이미지 등록 -->
+      <div id="ad-admin-upload-3" class="hidden">
+        <input type="file" id="ad-file-3" accept="image/*" style="font-size:9px; width:100%; margin-bottom:4px;">
+        <button class="dc-btn" style="width:100%; background:#534884;" onclick="uploadAdBanner(3)">광고란 3에 등록</button>
       </div>
     </div>
   </div>
@@ -1485,6 +1507,9 @@ HTML_PAGE = """
       const el = document.getElementById(id);
       if (el) el.innerHTML = '<li style="color:#888;">불러오는 중...</li>';
     });
+    // 📌 예전엔 여소남소 갤러리 요약만 별도 API(get_posts)로 다시 불러서 홈 화면을
+    //    열 때마다 요청이 2번 나갔습니다. 이제 get_home_summary 하나에 다 포함돼 있어
+    //    한 번의 요청으로 끝납니다.
     google.colab.kernel.invokeFunction('notebook.get_home_summary', [], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
@@ -1493,13 +1518,7 @@ HTML_PAGE = """
         renderHomeList('home-study-list', res.studies);
         renderHomeList('home-overseas-list', res.overseas);
         renderHomeList('home-recent-list', res.recents);
-      }
-    });
-    // 여소남소 갤러리 요약은 기존 get_posts API를 그대로 사용해 상위 4개만 표시
-    google.colab.kernel.invokeFunction('notebook.get_posts', ['all', 'date', 'dating', ''], {}).then(obj => {
-      const res = parseRes(obj);
-      if (res.success) {
-        renderHomeList('home-dating-list', res.posts.slice(0, 4).map(p => ({...p, gallery: 'dating'})));
+        renderHomeList('home-dating-list', res.datings);
       }
     });
   }
@@ -1597,7 +1616,7 @@ HTML_PAGE = """
   }
   // 📌 광고판 이미지
   function setAdAdminUploadVisible(isAdmin) {
-    [1, 2].forEach(slot => {
+    [1, 2, 3].forEach(slot => {
       const box = document.getElementById('ad-admin-upload-' + slot);
       if (box) box.classList.toggle('hidden', !isAdmin);
     });
@@ -1916,6 +1935,7 @@ HTML_PAGE = """
     try {
       loadAdBanner(1);
       loadAdBanner(2);
+      loadAdBanner(3);
       const savedGrade = localStorage.getItem('saerom_verified_grade');
       const isAdmin = localStorage.getItem('saerom_is_admin') === 'true';
       if (savedGrade) applyGradeUI(savedGrade, isAdmin);
