@@ -149,12 +149,11 @@ def send_email_py(to_email):
         server.quit()
         return {"success": True, "code": auth_code, "grade": assigned_grade, "is_admin": is_admin, "msg": "인증번호가 이메일로 발송되었습니다."}
     except Exception as e:
+        # 📌 실제 서비스에서는 발송 실패 시 인증번호를 절대 클라이언트로 내려보내지 않습니다
+        #    (그렇게 하면 이메일 인증을 우회해서 아무나 계정을 만들 수 있게 됩니다).
         return {
             "success": False,
-            "test_code": auth_code,
-            "grade": assigned_grade,
-            "is_admin": is_admin,
-            "msg": f"메일 발송 실패 (Gmail 앱 비밀번호 필요). [테스트용 인증번호: {auth_code}]"
+            "msg": "인증번호 메일 발송에 실패했습니다. 잠시 후 다시 시도하거나 관리자에게 문의해주세요."
         }
 
 
@@ -478,24 +477,22 @@ def set_ad_banner_py(slot, image_url, author_id, is_admin=False):
         return {"success": False, "msg": str(e)}
 
 
-def delete_post_py(post_id, password='', is_admin=False):
+def delete_post_py(post_id, author_id='', is_admin=False):
+    # 📌 예전에는 글마다 정해둔 비밀번호(기본값 '1234')로 아무나 지울 수 있었습니다.
+    #    이제 글쓰기 자체가 로그인 필수이므로, 삭제도 edit_post_py와 동일하게
+    #    "작성자 본인 또는 관리자"만 가능하도록 소유권으로 검사합니다.
     try:
         with db_cursor(commit=True) as c:
-            if is_admin:
-                c.execute('DELETE FROM posts WHERE id = %s', (post_id,))
-                c.execute('DELETE FROM comments WHERE post_id = %s', (post_id,))
-                return {"success": True, "msg": "[👑 관리자 권한] 게시글 삭제 완료."}
-            else:
-                c.execute('SELECT password FROM posts WHERE id = %s', (post_id,))
-                row = c.fetchone()
-                if not row:
-                    return {"success": False, "msg": "게시글이 존재하지 않습니다."}
-                if row[0] == password:
-                    c.execute('DELETE FROM posts WHERE id = %s', (post_id,))
-                    c.execute('DELETE FROM comments WHERE post_id = %s', (post_id,))
-                    return {"success": True, "msg": "게시글이 삭제되었습니다."}
-                else:
-                    return {"success": False, "msg": "비밀번호가 일치하지 않습니다."}
+            c.execute('SELECT author_id FROM posts WHERE id = %s', (post_id,))
+            row = c.fetchone()
+            if not row:
+                return {"success": False, "msg": "게시글이 존재하지 않습니다."}
+            if row[0] != author_id and not is_admin and author_id != ADMIN_LOGIN_ID:
+                return {"success": False, "msg": "본인이 작성한 글만 삭제할 수 있습니다."}
+            c.execute('DELETE FROM posts WHERE id = %s', (post_id,))
+            c.execute('DELETE FROM comments WHERE post_id = %s', (post_id,))
+            msg = "[👑 관리자 권한] 게시글 삭제 완료." if is_admin else "게시글이 삭제되었습니다."
+            return {"success": True, "msg": msg}
     except Exception as e:
         return {"success": False, "msg": str(e)}
 
@@ -706,7 +703,7 @@ HTML_PAGE = """
   <style>
     * { box-sizing: border-box; letter-spacing: -0.3px; }
     html, body { height: 100%; margin: 0; padding: 0; background: #f2f2f2; font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', '돋움', Dotum, sans-serif; }
-    .dc-wrapper { width: 100%; height: 720px; display: flex; flex-direction: column; background: #fff; border: 1px solid #3b4890; }
+    .dc-wrapper { width: 100%; height: 100vh; display: flex; flex-direction: column; background: #fff; }
     .dc-header { background: #3b4890; color: white; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
     .dc-header h1 { margin: 0; font-size: 15px; cursor: pointer; color: #ffffff; }
     .dc-header-right { display: flex; align-items: center; gap: 8px; }
@@ -839,7 +836,7 @@ HTML_PAGE = """
           <div style="flex-shrink:0;">
             <button id="btn-edit" class="dc-btn post-action-btn" style="background:#f0ad4e; display:none;" onclick="openEditBox()">✏️ 수정</button>
             <button id="btn-save" class="dc-btn post-action-btn" style="background:#95a5a6;" onclick="toggleSavePost()">☆ 저장</button>
-            <button class="dc-btn post-action-btn dc-btn-delete" onclick="deleteCurrentPost()">🗑️ 삭제</button>
+            <button id="btn-delete" class="dc-btn post-action-btn dc-btn-delete" style="display:none;" onclick="deleteCurrentPost()">🗑️ 삭제</button>
             <button class="dc-btn post-action-btn dc-btn-danger" onclick="reportCurrentPost()">🚨 신고</button>
           </div>
         </div>
@@ -855,10 +852,7 @@ HTML_PAGE = """
           <div id="comment-list" class="comment-list"></div>
           <div id="comment-login-notice" class="status-badge hidden">🔒 댓글 작성은 로그인 후 이용 가능합니다.</div>
           <div id="comment-write-area">
-            <div class="input-row">
-              <input type="text" id="cmt-author" class="auth-input" placeholder="닉네임" value="ㅇㅇ">
-              <input type="password" id="cmt-pw" class="auth-input" placeholder="비번" value="1234">
-            </div>
+            <input type="text" id="cmt-author" class="full-input" placeholder="닉네임" value="ㅇㅇ">
             <textarea id="cmt-content" placeholder="댓글 내용을 입력하세요..."></textarea>
             <div style="display:flex; align-items:center; gap:2px; margin-bottom:4px;">
               <input type="file" id="cmt-file" accept="image/*" style="font-size:9px; width:100%;">
@@ -943,10 +937,7 @@ HTML_PAGE = """
             <span id="my-id-display" style="font-size:9px; font-weight:normal;"></span>
           </div>
           <div id="write-form-container">
-            <div class="input-row">
-              <input type="text" id="post-author" class="auth-input" placeholder="닉네임" value="ㅇㅇ">
-              <input type="password" id="post-pw" class="auth-input" placeholder="비번" value="1234">
-            </div>
+            <input type="text" id="post-author" class="full-input" placeholder="닉네임" value="ㅇㅇ">
             <input type="text" id="post-title" class="full-input" placeholder="제목">
             <textarea id="post-content" placeholder="내용을 입력하세요..." style="height:140px;"></textarea>
             <div style="display:flex; align-items:center; gap:2px; margin-bottom:4px;">
@@ -1129,12 +1120,6 @@ HTML_PAGE = """
         msgDiv.innerText = res.msg;
         document.getElementById('code-step').classList.remove('hidden');
       } else {
-        if (res.test_code) {
-          serverAuthCode = res.test_code;
-          userGrade = res.grade;
-          serverIsAdmin = !!res.is_admin;
-          document.getElementById('code-step').classList.remove('hidden');
-        }
         msgDiv.style.color = "#e74c3c";
         msgDiv.innerText = res.msg;
       }
@@ -1330,6 +1315,48 @@ HTML_PAGE = """
     document.getElementById('post-view-box').classList.add('hidden');
     document.getElementById('view-write').classList.remove('hidden');
   }
+  // 📌 갤러리 하나에 맞는 "목록 화면" UI(글쓰기 버튼, 검색/정렬 노출 여부, 목록 데이터)를
+  //    구성합니다. 상단 탭을 눌러 갤러리를 바꿀 때(switchGallery)와, 홈/인기글 카드에서
+  //    다른 갤러리의 글을 곧바로 열었을 때(syncGalleryContextForPost) 공용으로 사용합니다.
+  function applyGalleryListUI(gal) {
+    const vHome = document.getElementById('view-home');
+    const vList = document.getElementById('view-list');
+    const writeFormContainer = document.getElementById('write-form-container');
+    const btnOpenWrite = document.getElementById('btn-open-write');
+    const searchBox = document.querySelector('.search-box');
+    const sortSelect = document.getElementById('sort-select');
+    vHome.classList.add('hidden');
+    vList.classList.remove('hidden');
+    const isAdmin = localStorage.getItem('saerom_is_admin') === 'true';
+    if (gal === 'saved') {
+      // 📌 저장한 글 목록: 글쓰기/검색/정렬 없이 저장한 글만 보여줌
+      btnOpenWrite.classList.add('hidden');
+      if (searchBox) searchBox.classList.add('hidden');
+      if (sortSelect) sortSelect.classList.add('hidden');
+      loadSavedPosts();
+      return;
+    }
+    if (searchBox) searchBox.classList.remove('hidden');
+    if (sortSelect) sortSelect.classList.remove('hidden');
+    if (gal === 'concept') {
+      btnOpenWrite.classList.add('hidden');
+    } else if (gal === 'admin_notice') {
+      btnOpenWrite.classList.remove('hidden');
+      if (isAdmin) {
+        writeFormContainer.classList.remove('hidden');
+        document.getElementById('write-box-title').innerText = "✍️ 관리자 공지 작성";
+      } else {
+        writeFormContainer.classList.add('hidden');
+        document.getElementById('write-box-title').innerText = "🔒 관리자 채널 (관리자만 작성 가능)";
+      }
+    } else {
+      btnOpenWrite.classList.remove('hidden');
+      writeFormContainer.classList.remove('hidden');
+      document.getElementById('write-box-title').innerText = "✍️ 글쓰기";
+    }
+    document.getElementById('my-id-display').innerText = `ID:(${getMyUserId()})`;
+    loadPosts();
+  }
   function switchGallery(gal) {
     if (['g1', 'g2', 'g3'].includes(gal)) {
       const savedGrade = localStorage.getItem('saerom_verified_grade');
@@ -1349,52 +1376,31 @@ HTML_PAGE = """
     if (activeTab) activeTab.classList.add('active');
     document.getElementById('current-gallery-title').innerText = gal === 'home' ? '🏠 홈' : (galNames[gal] || '갤러리');
     closeView();
-    const vHome = document.getElementById('view-home');
-    const vList = document.getElementById('view-list');
-    const vWrite = document.getElementById('view-write');
-    const writeFormContainer = document.getElementById('write-form-container');
-    const btnOpenWrite = document.getElementById('btn-open-write');
-    const searchBox = document.querySelector('.search-box');
-    const sortSelect = document.getElementById('sort-select');
     // 갤러리를 바꿀 때마다 글쓰기 화면은 항상 닫힌 상태로 시작 (버튼을 눌러야 열림)
-    vWrite.classList.add('hidden');
+    document.getElementById('view-write').classList.add('hidden');
     if (gal === 'home') {
-      vHome.classList.remove('hidden');
-      vList.classList.add('hidden');
+      document.getElementById('view-home').classList.remove('hidden');
+      document.getElementById('view-list').classList.add('hidden');
       loadHomeSummary();
     } else {
-      vHome.classList.add('hidden');
-      vList.classList.remove('hidden');
-      const isAdmin = localStorage.getItem('saerom_is_admin') === 'true';
-      if (gal === 'saved') {
-        // 📌 저장한 글 목록: 글쓰기/검색/정렬 없이 저장한 글만 보여줌
-        btnOpenWrite.classList.add('hidden');
-        if (searchBox) searchBox.classList.add('hidden');
-        if (sortSelect) sortSelect.classList.add('hidden');
-        loadSavedPosts();
-        return;
-      }
-      if (searchBox) searchBox.classList.remove('hidden');
-      if (sortSelect) sortSelect.classList.remove('hidden');
-      if (gal === 'concept') {
-        btnOpenWrite.classList.add('hidden');
-      } else if (gal === 'admin_notice') {
-        btnOpenWrite.classList.remove('hidden');
-        if (isAdmin) {
-          writeFormContainer.classList.remove('hidden');
-          document.getElementById('write-box-title').innerText = "✍️ 관리자 공지 작성";
-        } else {
-          writeFormContainer.classList.add('hidden');
-          document.getElementById('write-box-title').innerText = "🔒 관리자 채널 (관리자만 작성 가능)";
-        }
-      } else {
-        btnOpenWrite.classList.remove('hidden');
-        writeFormContainer.classList.remove('hidden');
-        document.getElementById('write-box-title').innerText = "✍️ 글쓰기";
-      }
-      document.getElementById('my-id-display').innerText = `ID:(${getMyUserId()})`;
-      loadPosts();
+      applyGalleryListUI(gal);
     }
+  }
+  // 📌 홈/인기글 카드에서 다른 갤러리의 글을 바로 열면, 화면 아래 목록이 그 글의
+  //    갤러리로 맞춰지도록 동기화합니다 (이미 서버가 내려준 글을 보여주는 것뿐이라
+  //    학년 갤러리 접근 권한 알림은 띄우지 않습니다 - 탭을 직접 눌러 들어갈 때만 검사합니다).
+  function syncGalleryContextForPost(gal) {
+    if (!gal || gal === currentGallery) return;
+    currentGallery = gal;
+    currentSearchKw = '';
+    const searchInput = document.getElementById('search-kw');
+    if (searchInput) searchInput.value = '';
+    document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+    const activeTab = document.getElementById('tab-' + gal);
+    if (activeTab) activeTab.classList.add('active');
+    document.getElementById('current-gallery-title').innerText = galNames[gal] || '갤러리';
+    document.getElementById('view-write').classList.add('hidden');
+    applyGalleryListUI(gal);
   }
   function changeSort(sortType) {
     currentSort = sortType;
@@ -1405,6 +1411,11 @@ HTML_PAGE = """
     loadPosts();
   }
   function loadHomeSummary() {
+    // 📌 서버 응답을 기다리는 동안 화면이 멈춘 것처럼 보이지 않도록 즉시 로딩 표시를 띄웁니다.
+    ['home-concept-list', 'home-study-list', 'home-overseas-list', 'home-recent-list', 'home-dating-list'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<li style="color:#888;">불러오는 중...</li>';
+    });
     google.colab.kernel.invokeFunction('notebook.get_home_summary', [], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
@@ -1463,9 +1474,12 @@ HTML_PAGE = """
   function loadPosts() {
     const tabType = (currentGallery === 'concept') ? 'concept' : 'all';
     const galType = (currentGallery === 'concept' || currentGallery === 'all') ? 'all_global' : currentGallery;
+    const tbody = document.getElementById('post-list');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#888; padding:15px;">불러오는 중...</td></tr>';
     google.colab.kernel.invokeFunction('notebook.get_posts', [tabType, currentSort, galType, currentSearchKw], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) renderPostTable(res.posts);
+      else if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#e74c3c; padding:15px;">불러오지 못했습니다. 새로고침 해주세요.</td></tr>';
     });
   }
   // 📌 저장(즐겨찾기)한 글 목록 - localStorage에 저장된 글 id들만 서버에서 가져와 보여줌
@@ -1503,9 +1517,12 @@ HTML_PAGE = """
   }
   function loadSavedPosts() {
     const ids = getSavedIds();
+    const tbody = document.getElementById('post-list');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#888; padding:15px;">불러오는 중...</td></tr>';
     google.colab.kernel.invokeFunction('notebook.get_posts_by_ids', [ids], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) renderPostTable(res.posts);
+      else if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#e74c3c; padding:15px;">불러오지 못했습니다. 새로고침 해주세요.</td></tr>';
     });
   }
   // 📌 광고판 이미지
@@ -1548,7 +1565,7 @@ HTML_PAGE = """
     if (!isLoggedIn()) { alert("글쓰기는 로그인 후 이용 가능합니다."); return; }
     const btn = document.getElementById('btn-submit-post');
     if (btn.disabled) return;
-    const a = document.getElementById('post-author').value, p = document.getElementById('post-pw').value;
+    const a = document.getElementById('post-author').value;
     const t = document.getElementById('post-title').value, c = document.getElementById('post-content').value;
     const fileInput = document.getElementById('post-file');
     const isAdmin = localStorage.getItem('saerom_is_admin') === 'true';
@@ -1563,16 +1580,16 @@ HTML_PAGE = """
       const reader = new FileReader();
       reader.onload = function(e) {
         if (editingPostId) sendEditApi(t, c, e.target.result, finish);
-        else sendPostApi(t, c, a, p, e.target.result, isAdmin, finish);
+        else sendPostApi(t, c, a, e.target.result, isAdmin, finish);
       };
       reader.readAsDataURL(fileInput.files[0]);
     } else {
       if (editingPostId) sendEditApi(t, c, '', finish);
-      else sendPostApi(t, c, a, p, '', isAdmin, finish);
+      else sendPostApi(t, c, a, '', isAdmin, finish);
     }
   }
-  function sendPostApi(title, content, author, password, imageUrl, isAdmin, callback) {
-    google.colab.kernel.invokeFunction('notebook.add_post', [title, content, author, getMyUserId(), password, currentGallery, imageUrl, isAdmin], {}).then(obj => {
+  function sendPostApi(title, content, author, imageUrl, isAdmin, callback) {
+    google.colab.kernel.invokeFunction('notebook.add_post', [title, content, author, getMyUserId(), '', currentGallery, imageUrl, isAdmin], {}).then(obj => {
       if (callback) callback();
       const res = parseRes(obj);
       if (res.success) {
@@ -1606,29 +1623,20 @@ HTML_PAGE = """
   }
   function deleteCurrentPost() {
     if (!currentPostId) return;
+    if (!isLoggedIn()) { alert("로그인 후 이용 가능합니다."); return; }
     const isAdmin = localStorage.getItem('saerom_is_admin') === 'true';
-    if (isAdmin) {
-      if (!confirm("👑 [관리자 권한] 이 게시글을 즉시 삭제하시겠습니까?")) return;
-      google.colab.kernel.invokeFunction('notebook.delete_post', [currentPostId, '', true], {}).then(obj => {
-        const res = parseRes(obj);
-        alert(res.msg);
-        if (res.success) {
-          closeView();
-          if (currentGallery === 'home') loadHomeSummary(); else loadPosts();
-        }
-      });
-    } else {
-      const inputPw = prompt("게시글 삭제 비밀번호를 입력하세요:");
-      if (!inputPw) return;
-      google.colab.kernel.invokeFunction('notebook.delete_post', [currentPostId, inputPw, false], {}).then(obj => {
-        const res = parseRes(obj);
-        alert(res.msg);
-        if (res.success) {
-          closeView();
-          if (currentGallery === 'home') loadHomeSummary(); else loadPosts();
-        }
-      });
-    }
+    // 📌 글쓰기 자체가 로그인 필수라 작성자가 누구인지 이미 알고 있으므로,
+    //    삭제도 비밀번호 대신 "본인 글인지"로 서버가 판단합니다.
+    const confirmMsg = isAdmin ? "👑 [관리자 권한] 이 게시글을 즉시 삭제하시겠습니까?" : "이 게시글을 삭제하시겠습니까?";
+    if (!confirm(confirmMsg)) return;
+    google.colab.kernel.invokeFunction('notebook.delete_post', [currentPostId, getMyUserId(), isAdmin], {}).then(obj => {
+      const res = parseRes(obj);
+      alert(res.msg);
+      if (res.success) {
+        closeView();
+        if (currentGallery === 'home') loadHomeSummary(); else loadPosts();
+      }
+    });
   }
   // 📌 댓글 목록 렌더링 (최초 진입 시 + 아래 실시간 자동 새로고침에서 공용으로 사용)
   function renderComments(comments) {
@@ -1691,11 +1699,25 @@ HTML_PAGE = """
   }
   function viewPost(postId) {
     currentPostId = postId;
+    // 📌 서버 응답을 기다리는 동안 클릭이 씹힌 것처럼 보이지 않도록, 요청 즉시
+    //    로딩 상태를 먼저 보여줍니다 (특히 Render 무료 플랜은 첫 응답이 몇십 초 걸릴 수 있음).
+    document.getElementById('view-title').innerText = '불러오는 중...';
+    document.getElementById('view-meta').innerText = '';
+    document.getElementById('view-content').innerText = '';
+    document.getElementById('view-image-container').innerHTML = '';
+    document.getElementById('comment-list').innerHTML = '';
+    document.getElementById('post-view-box').classList.remove('hidden');
+    const contentAreaEarly = document.querySelector('.dc-content');
+    if (contentAreaEarly) contentAreaEarly.scrollTop = 0;
+    document.getElementById('post-view-box').scrollIntoView({ block: 'start' });
     google.colab.kernel.invokeFunction('notebook.get_post_detail', [postId, true], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
         const p = res.post;
         currentPostData = p;
+        // 📌 홈/인기글 카드에서 다른 갤러리의 글을 바로 열었을 때, 화면 아래 목록이
+        //    엉뚱한 갤러리 내용으로 남아있지 않도록 이 글의 갤러리로 맞춰줍니다.
+        syncGalleryContextForPost(p.gallery);
         let tagHtml = `<span class="badge-gal">${galNames[p.gallery] || '기타'}</span> `;
         if (p.gallery === 'admin_notice') tagHtml = `<span class="badge-admin">공지</span> `;
         if (p.is_concept) tagHtml += `<span class="badge-concept">인기</span> `;
@@ -1714,6 +1736,9 @@ HTML_PAGE = """
         const canEdit = loggedIn && (getMyUserId() === p.author_id || isAdminNow);
         const editBtn = document.getElementById('btn-edit');
         if (editBtn) editBtn.style.display = canEdit ? 'inline-block' : 'none';
+        // 📌 삭제도 수정과 동일하게 "본인 글 또는 관리자"만 버튼이 보이도록 합니다.
+        const deleteBtn = document.getElementById('btn-delete');
+        if (deleteBtn) deleteBtn.style.display = canEdit ? 'inline-block' : 'none';
         refreshSaveButton();
         document.getElementById('post-view-box').classList.remove('hidden');
         // 📌 detail 영역이 항상 목록 위쪽에 있으므로, 목록에서 다른 글을 눌렀을 때도
@@ -1722,6 +1747,9 @@ HTML_PAGE = """
         if (contentArea) contentArea.scrollTop = 0;
         document.getElementById('post-view-box').scrollIntoView({ block: 'start' });
         startDetailPolling();
+      } else {
+        document.getElementById('view-title').innerText = '글을 불러오지 못했습니다.';
+        document.getElementById('view-content').innerText = res.msg || '잠시 후 다시 시도해주세요.';
       }
     });
   }
@@ -1751,7 +1779,7 @@ HTML_PAGE = """
     if (!isLoggedIn()) { alert("댓글 작성은 로그인 후 이용 가능합니다."); return; }
     const btn = document.getElementById('btn-submit-cmt');
     if (btn.disabled) return;
-    const a = document.getElementById('cmt-author').value, p = document.getElementById('cmt-pw').value, c = document.getElementById('cmt-content').value;
+    const a = document.getElementById('cmt-author').value, c = document.getElementById('cmt-content').value;
     const fileInput = document.getElementById('cmt-file');
     btn.disabled = true;
     btn.innerText = "등록 중...";
@@ -1761,14 +1789,14 @@ HTML_PAGE = """
     };
     if (fileInput.files && fileInput.files[0]) {
       const reader = new FileReader();
-      reader.onload = function(e) { sendCommentApi(c, a, p, e.target.result, finish); };
+      reader.onload = function(e) { sendCommentApi(c, a, e.target.result, finish); };
       reader.readAsDataURL(fileInput.files[0]);
     } else {
-      sendCommentApi(c, a, p, '', finish);
+      sendCommentApi(c, a, '', finish);
     }
   }
-  function sendCommentApi(content, author, password, imageUrl, callback) {
-    google.colab.kernel.invokeFunction('notebook.add_comment', [currentPostId, content, author, getMyUserId(), password, imageUrl], {}).then(obj => {
+  function sendCommentApi(content, author, imageUrl, callback) {
+    google.colab.kernel.invokeFunction('notebook.add_comment', [currentPostId, content, author, getMyUserId(), '', imageUrl], {}).then(obj => {
       if (callback) callback();
       if (parseRes(obj).success) {
         document.getElementById('cmt-content').value = '';
