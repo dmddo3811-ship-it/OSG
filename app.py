@@ -79,13 +79,16 @@ DB_POOL = pg_pool.ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode="require")
 
 @contextmanager
 def db_cursor(commit=False):
-    """풀에서 커넥션을 빌려 쓰고, 끝나면(실패해도) 반드시 풀에 반납한다."""
+    """풀에서 커넥션을 빌려 쓰고, 끝나면(실패해도) 반드시 풀에 반납한다.
+    📌 commit 여부와 무관하게 항상 트랜잭션을 끝내고( commit ) 반납한다.
+       그냥 read만 하는 경우에도 트랜잭션을 안 끝내고 반납하면, 커넥션 풀에서
+       그 커넥션을 재사용할 때 예전 스냅샷을 계속 들고 있어서 다른 곳에서 쓴
+       댓글/글이 안 보이는 문제가 생긴다 (PgBouncer transaction 모드와도 상충됨)."""
     conn = DB_POOL.getconn()
     try:
         cur = conn.cursor()
         yield cur
-        if commit:
-            conn.commit()
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -1501,12 +1504,15 @@ HTML_PAGE = """
     currentSearchKw = document.getElementById('search-kw').value.trim();
     loadPosts();
   }
-  function loadHomeSummary() {
-    // 📌 서버 응답을 기다리는 동안 화면이 멈춘 것처럼 보이지 않도록 즉시 로딩 표시를 띄웁니다.
-    ['home-concept-list', 'home-notice-list', 'home-study-list', 'home-overseas-list', 'home-recent-list', 'home-dating-list'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.innerHTML = '<li style="color:#888;">불러오는 중...</li>';
-    });
+  function loadHomeSummary(silent) {
+    // 📌 처음 홈 화면에 들어올 때만 로딩 표시를 띄우고, 체류 중 백그라운드
+    //    자동 새로고침(silent=true)에서는 기존 목록을 그대로 둔 채 조용히 갱신합니다.
+    if (!silent) {
+      ['home-concept-list', 'home-notice-list', 'home-study-list', 'home-overseas-list', 'home-recent-list', 'home-dating-list'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '<li style="color:#888;">불러오는 중...</li>';
+      });
+    }
     // 📌 예전엔 여소남소 갤러리 요약만 별도 API(get_posts)로 다시 불러서 홈 화면을
     //    열 때마다 요청이 2번 나갔습니다. 이제 get_home_summary 하나에 다 포함돼 있어
     //    한 번의 요청으로 끝납니다.
@@ -1560,15 +1566,18 @@ HTML_PAGE = """
       tbody.appendChild(tr);
     });
   }
-  function loadPosts() {
+  function loadPosts(silent) {
+    // 📌 갤러리를 새로 열 때는 로딩 표시를 보여주지만, 같은 갤러리에 머무는 동안의
+    //    백그라운드 자동 새로고침(silent=true)에서는 기존 글 목록을 그대로 둔 채
+    //    조용히 새 데이터로만 교체합니다.
     const tabType = (currentGallery === 'concept') ? 'concept' : 'all';
     const galType = (currentGallery === 'concept' || currentGallery === 'all') ? 'all_global' : currentGallery;
     const tbody = document.getElementById('post-list');
-    if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#888; padding:15px;">불러오는 중...</td></tr>';
+    if (!silent && tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#888; padding:15px;">불러오는 중...</td></tr>';
     google.colab.kernel.invokeFunction('notebook.get_posts', [tabType, currentSort, galType, currentSearchKw], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) renderPostTable(res.posts);
-      else if (tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#e74c3c; padding:15px;">불러오지 못했습니다. 새로고침 해주세요.</td></tr>';
+      else if (!silent && tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#e74c3c; padding:15px;">불러오지 못했습니다. 새로고침 해주세요.</td></tr>';
     });
   }
   // 📌 저장(즐겨찾기)한 글 목록 - localStorage에 저장된 글 id들만 서버에서 가져와 보여줌
@@ -1777,9 +1786,9 @@ HTML_PAGE = """
       const vHome = document.getElementById('view-home');
       if (currentPostId) return; // 상세글을 보고 있을 땐 목록 폴링 대신 댓글 폴링만
       if (currentGallery === 'home' && vHome && !vHome.classList.contains('hidden')) {
-        loadHomeSummary();
+        loadHomeSummary(true);
       } else if (currentGallery !== 'saved' && vList && !vList.classList.contains('hidden') && vWrite && vWrite.classList.contains('hidden')) {
-        loadPosts();
+        loadPosts(true);
       }
     }, 8000);
   }
