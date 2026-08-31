@@ -28,6 +28,11 @@ from flask import Flask, request, jsonify, Response
 ADMIN_EMAILS = [e.strip() for e in os.environ.get(
     "ADMIN_EMAILS", "2510326@saerom.hs.kr,2510924@saerom.hs.kr"
 ).split(",") if e.strip()]
+# 📌 학교폭력 등 긴급/안전 관련 신고·요청은 학생회 담당자(ADMIN_EMAILS)뿐 아니라
+#    지도 교사에게도 함께 전달되어야 합니다. Render 환경변수 TEACHER_EMAILS에
+#    지도 교사 이메일(쉼표로 여러 명 가능)을 등록하세요. 등록 전까지는 비어 있어
+#    긴급 신고가 실제로는 교사에게 가지 않으니, 실제 운영 전 반드시 설정해야 합니다.
+TEACHER_EMAILS = [e.strip() for e in os.environ.get("TEACHER_EMAILS", "").split(",") if e.strip()]
 ADMIN_LOGIN_ID = os.environ.get("ADMIN_LOGIN_ID", "OSG_admin")
 ADMIN_LOGIN_PASSWORD = os.environ.get("ADMIN_LOGIN_PASSWORD", "qwerty4321!")
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
@@ -681,15 +686,22 @@ def send_admin_request_py(req_category, sender_contact, content):
     try:
         if not content.strip():
             return {"success": False, "msg": "요청 내용을 입력해주세요."}
-        subject = f"[온리새롬 문의] [{req_category}] 요청이 접수되었습니다."
+        # 📌 학교폭력 등 긴급/안전 관련 신고는 학생회 담당자뿐 아니라 지도 교사에게도
+        #    함께 전달합니다. TEACHER_EMAILS가 설정되어 있지 않으면 학생회에만 갑니다.
+        is_urgent = (req_category == '학교폭력 등 긴급/안전 신고')
+        recipients = list(ADMIN_EMAILS)
+        if is_urgent:
+            recipients += [e for e in TEACHER_EMAILS if e not in recipients]
+        subject = f"{'[🚨긴급] ' if is_urgent else ''}[온리새롬 문의] [{req_category}] 요청이 접수되었습니다."
         body = f"온리새롬 갤러리에 새로운 관리자 요청이 접수되었습니다.\n\n" \
                f"▪ 요청 카테고리: {req_category}\n" \
                f"▪ 작성자/연락처: {sender_contact or '미기입'}\n" \
-               f"▪ 접수 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
+               f"▪ 접수 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
+               f"▪ 지도 교사 전달 여부: {'예' if (is_urgent and TEACHER_EMAILS) else '아니오'}\n\n" \
                f"----------------------------------------\n" \
                f"[요청 내용]\n{content}\n" \
                f"----------------------------------------"
-        send_mail_via_brevo(ADMIN_EMAILS, subject, body)
+        send_mail_via_brevo(recipients, subject, body)
         return {"success": True, "msg": "관리자에게 성공적으로 전달되었습니다."}
     except Exception as e:
         return {"success": False, "msg": f"발송 중 오류 발생: {str(e)}"}
@@ -1041,7 +1053,9 @@ def vote_post_py(post_id, vote_type):
         return {"success": False, "msg": str(e)}
 
 
-def report_item_py(target_type, target_id, reason="사용자 신고", reporter_id=''):
+def report_item_py(target_type, target_id, reason="사용자 신고", reporter_id='', is_urgent=False):
+    """📌 is_urgent=True(학교폭력 등 즉시 확인이 필요한 신고)이면 학생회 담당자뿐 아니라
+    지도 교사(TEACHER_EMAILS)에게도 함께 메일이 전달됩니다."""
     hidden_now = False
     try:
         with db_cursor(commit=True) as c:
@@ -1054,16 +1068,22 @@ def report_item_py(target_type, target_id, reason="사용자 신고", reporter_i
     base_msg = "신고가 접수되어 관리자 이메일로 전송되었습니다."
     if hidden_now:
         base_msg = f"신고가 접수되었습니다. 신고가 {REPORT_HIDE_THRESHOLD}건 이상 누적되어 해당 글/댓글은 관리자 검토 전까지 자동으로 숨김 처리되었습니다."
+    if is_urgent:
+        base_msg += " 지도 교사에게도 함께 전달되었습니다." if TEACHER_EMAILS else " (지도 교사 이메일이 아직 등록되지 않아 학생회에만 전달되었습니다.)"
     try:
         report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        subject = f"[온리새롬 신고 접수] {target_type.upper()} 번호 #{target_id}"
+        recipients = list(ADMIN_EMAILS)
+        if is_urgent:
+            recipients += [e for e in TEACHER_EMAILS if e not in recipients]
+        subject = f"{'[🚨긴급/학교폭력 의심] ' if is_urgent else ''}[온리새롬 신고 접수] {target_type.upper()} 번호 #{target_id}"
         body = f"온리새롬 갤러리에 새로운 신고가 접수되었습니다.\n\n" \
                f"▪ 신고 대상: {target_type}\n" \
                f"▪ 대상 ID: {target_id}\n" \
                f"▪ 신고 사유: {reason}\n" \
                f"▪ 접수 시각: {report_time}\n" \
+               f"▪ 긴급(학교폭력 등) 신고 여부: {'예' if is_urgent else '아니오'}\n" \
                f"▪ 자동 숨김 여부: {'예 (신고 누적)' if hidden_now else '아니오'}\n"
-        send_mail_via_brevo(ADMIN_EMAILS, subject, body)
+        send_mail_via_brevo(recipients, subject, body)
         return {"success": True, "msg": base_msg, "hidden": hidden_now}
     except Exception as e:
         return {"success": True, "msg": f"{base_msg} (메일 발송 안내: {str(e)})", "hidden": hidden_now}
@@ -1287,7 +1307,8 @@ def api_report_item():
     a = _args()
     return jsonify(report_item_py(
         a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else None,
-        a[2] if len(a) > 2 else '사용자 신고', a[3] if len(a) > 3 else ''
+        a[2] if len(a) > 2 else '사용자 신고', a[3] if len(a) > 3 else '',
+        bool(a[4]) if len(a) > 4 else False
     ))
 
 
@@ -1748,6 +1769,7 @@ HTML_PAGE = """
     <div style="margin-bottom:6px;">
       <label style="font-size:10px; font-weight:bold; color:#555;">요청 유형</label>
       <select id="req-category" class="full-input" style="margin-top:2px;">
+        <option value="학교폭력 등 긴급/안전 신고">🚨 학교폭력 등 긴급/안전 신고 (지도 교사 즉시 전달)</option>
         <option value="웹사이트 수정 요청">🌐 웹사이트 수정 요청</option>
         <option value="홍보 및 제휴 문의">📢 홍보 및 제휴 문의</option>
         <option value="기능 추가 건의">💡 기능 추가 건의</option>
@@ -2952,7 +2974,8 @@ HTML_PAGE = """
     if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
     const reason = prompt("게시글 신고 사유를 입력하세요:\n(※ 사실이 아니거나 악의적인 신고가 반복되면 계정 이용에 영향이 있을 수 있으니, 신중하게 이용해주세요.)");
     if (!reason || !reason.trim()) return;
-    google.colab.kernel.invokeFunction('notebook.report_item', ['게시글', currentPostId, reason.trim(), getMyUserId()], {}).then(obj => {
+    const urgent = confirm("학교폭력 등 지도 교사가 즉시 확인해야 하는 사안인가요?\n(예를 누르면 학생회 담당자뿐 아니라 지도 교사에게도 바로 전달됩니다.)");
+    google.colab.kernel.invokeFunction('notebook.report_item', ['게시글', currentPostId, reason.trim(), getMyUserId(), urgent], {}).then(obj => {
       const res = parseRes(obj);
       alert(res.msg || "신고가 접수되었습니다.");
       if (res.hidden) closeView();
@@ -2962,7 +2985,8 @@ HTML_PAGE = """
     if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
     const reason = prompt("댓글 신고 사유를 입력하세요:\n(※ 사실이 아니거나 악의적인 신고가 반복되면 계정 이용에 영향이 있을 수 있으니, 신중하게 이용해주세요.)");
     if (!reason || !reason.trim()) return;
-    google.colab.kernel.invokeFunction('notebook.report_item', ['댓글', commentId, reason.trim(), getMyUserId()], {}).then(obj => {
+    const urgent = confirm("학교폭력 등 지도 교사가 즉시 확인해야 하는 사안인가요?\n(예를 누르면 학생회 담당자뿐 아니라 지도 교사에게도 바로 전달됩니다.)");
+    google.colab.kernel.invokeFunction('notebook.report_item', ['댓글', commentId, reason.trim(), getMyUserId(), urgent], {}).then(obj => {
       const res = parseRes(obj);
       alert(res.msg || "신고가 접수되었습니다.");
       if (res.hidden && currentPostId) viewPost(currentPostId);
