@@ -207,8 +207,16 @@ def init_db():
         for col, coltype in [("reporter_id", "TEXT DEFAULT ''")]:
             c.execute(f"ALTER TABLE reports ADD COLUMN IF NOT EXISTS {col} {coltype}")
         # 📌 가입 시 받은 동의 기록(개인정보 수집·이용 / 운영정책). 동의 시각을 남겨둡니다.
-        for col, coltype in [("privacy_agreed_at", "TEXT DEFAULT ''"), ("terms_agreed_at", "TEXT DEFAULT ''")]:
+        # 📌 이용자 제재: 경고 횟수, 정지 여부, 정지 해제 예정일(영구 정지면 빈 문자열), 사유.
+        for col, coltype in [("privacy_agreed_at", "TEXT DEFAULT ''"), ("terms_agreed_at", "TEXT DEFAULT ''"),
+                              ("warning_count", "INTEGER DEFAULT 0"), ("is_suspended", "INTEGER DEFAULT 0"),
+                              ("suspend_until", "TEXT DEFAULT ''"), ("suspend_reason", "TEXT DEFAULT ''"),
+                              ("suspend_permanent", "INTEGER DEFAULT 0")]:
             c.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {coltype}")
+        # 📌 관리자 활동 로그에서 "이용자(학번)"를 대상으로 한 조치(경고/정지/해제)를 기록할 컬럼.
+        #    target_id(INTEGER)는 글/댓글 번호용이라 학번(문자열) 저장에는 별도 컬럼이 필요합니다.
+        for col, coltype in [("target_user", "TEXT DEFAULT ''")]:
+            c.execute(f"ALTER TABLE admin_logs ADD COLUMN IF NOT EXISTS {col} {coltype}")
         # 📌 관리자 권한은 이메일 인증 계정이 아닌 별도의 관리자 로그인(ADMIN_LOGIN_ID)으로만 부여됩니다.
         c.execute("UPDATE users SET is_admin = 0")
         # 📌 글/댓글이 쌓일수록 gallery, is_concept로 걸러내거나 댓글 수를 세는 쿼리가
@@ -365,13 +373,13 @@ PROFANITY_BLOCK_MSG = ("욕설 또는 비하 표현이 포함되어 있어 등�
 # ==========================================
 # 📌 0-3. 관리자 활동 로그 / 신고 누적 자동 숨김 / 데이터 보존
 # ==========================================
-def _write_admin_log(c, admin_id, action, target_type='', target_id=None, detail=''):
-    """관리 행위(삭제/숨김/복구 등)를 기록합니다. 학교 감사·학폭 조사 시 소명 근거가 됩니다."""
+def _write_admin_log(c, admin_id, action, target_type='', target_id=None, detail='', target_user=''):
+    """관리 행위(삭제/숨김/복구/제재 등)를 기록합니다. 학교 감사·학폭 조사 시 소명 근거가 됩니다."""
     c.execute('''
-        INSERT INTO admin_logs (admin_id, action, target_type, target_id, detail, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO admin_logs (admin_id, action, target_type, target_id, detail, created_at, target_user)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
     ''', (admin_id or 'UNKNOWN', action, target_type or '', target_id,
-          (detail or '')[:500], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+          (detail or '')[:500], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), target_user or ''))
 
 
 def _target_table(target_type):
@@ -481,6 +489,113 @@ def _is_verified_user(student_id):
         return False
 
 
+# ==========================================
+# 📌 0-4. 이용자 제재 (경고 / 일시정지 / 영구정지 / 해제)
+# ==========================================
+def _check_suspension(c, student_id):
+    """현재 이용 제한 상태를 확인합니다. 기간이 지난 일시정지는 이 시점에 자동으로 풀어줍니다.
+    반환: {"suspended": bool, "permanent": bool, "until": str, "reason": str, "warning_count": int}"""
+    c.execute('SELECT warning_count, is_suspended, suspend_until, suspend_reason, suspend_permanent FROM users WHERE student_id = %s', (student_id,))
+    row = c.fetchone()
+    if not row:
+        return {"suspended": False, "permanent": False, "until": "", "reason": "", "warning_count": 0}
+    warning_count, is_suspended, suspend_until, suspend_reason, permanent = row
+    if is_suspended and not permanent and suspend_until:
+        try:
+            expired = datetime.now() >= datetime.strptime(suspend_until, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            expired = False
+        if expired:
+            c.execute('UPDATE users SET is_suspended = 0, suspend_until = %s, suspend_reason = %s WHERE student_id = %s',
+                      ('', '', student_id))
+            _write_admin_log(c, 'SYSTEM', '이용 제한 자동 해제', target_user=student_id, detail='정지 기간 만료')
+            return {"suspended": False, "permanent": False, "until": "", "reason": "", "warning_count": warning_count}
+    return {"suspended": bool(is_suspended), "permanent": bool(permanent), "until": suspend_until or "",
+            "reason": suspend_reason or "", "warning_count": warning_count or 0}
+
+
+def _suspension_message(status):
+    if status["permanent"]:
+        return f"이용이 영구 정지된 계정입니다. (사유: {status['reason'] or '운영정책 위반'})"
+    return f"이용이 일시 정지된 계정입니다. ({status['until']}까지, 사유: {status['reason'] or '운영정책 위반'})"
+
+
+def apply_user_sanction_py(student_id, action, reason, admin_id, is_admin=False, days=0):
+    """📌 관리자가 특정 학번에 대해 경고/일시정지/영구정지/해제 조치를 적용합니다.
+    action: '경고' | '일시정지' | '영구정지' | '해제'"""
+    try:
+        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+            return {"success": False, "msg": "관리자만 사용할 수 있는 기능입니다."}
+        student_id = (student_id or '').strip()
+        if not student_id:
+            return {"success": False, "msg": "학번을 입력하세요."}
+        with db_cursor(commit=True) as c:
+            c.execute('SELECT student_id FROM users WHERE student_id = %s', (student_id,))
+            if not c.fetchone():
+                return {"success": False, "msg": "해당 학번으로 가입된 계정이 없습니다."}
+            if action == '경고':
+                c.execute('UPDATE users SET warning_count = warning_count + 1 WHERE student_id = %s', (student_id,))
+                _write_admin_log(c, admin_id, '경고', target_user=student_id, detail=reason or '')
+                return {"success": True, "msg": f"{student_id} 학번에 경고를 부여했습니다."}
+            elif action == '일시정지':
+                days = int(days) if days else 7
+                until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+                c.execute('UPDATE users SET is_suspended = 1, suspend_permanent = 0, suspend_until = %s, suspend_reason = %s WHERE student_id = %s',
+                          (until, reason or '', student_id))
+                _write_admin_log(c, admin_id, '일시정지', target_user=student_id, detail=f'{days}일 / 사유: {reason or ""}')
+                return {"success": True, "msg": f"{student_id} 학번을 {days}일간 이용 정지했습니다. (~{until})"}
+            elif action == '영구정지':
+                c.execute('UPDATE users SET is_suspended = 1, suspend_permanent = 1, suspend_until = %s, suspend_reason = %s WHERE student_id = %s',
+                          ('', reason or '', student_id))
+                _write_admin_log(c, admin_id, '영구정지', target_user=student_id, detail=reason or '')
+                return {"success": True, "msg": f"{student_id} 학번을 영구 정지했습니다."}
+            elif action == '해제':
+                c.execute('UPDATE users SET is_suspended = 0, suspend_permanent = 0, suspend_until = %s, suspend_reason = %s WHERE student_id = %s',
+                          ('', '', student_id))
+                _write_admin_log(c, admin_id, '이용 제한 해제', target_user=student_id, detail=reason or '')
+                return {"success": True, "msg": f"{student_id} 학번의 이용 제한을 해제했습니다."}
+            else:
+                return {"success": False, "msg": "알 수 없는 조치입니다."}
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+
+
+def get_user_sanction_status_py(student_id, admin_id, is_admin=False):
+    """📌 관리자 패널에서 특정 학번의 현재 제재 상태를 조회합니다."""
+    try:
+        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+            return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
+        student_id = (student_id or '').strip()
+        with db_cursor(commit=True) as c:
+            c.execute('SELECT student_id, grade FROM users WHERE student_id = %s', (student_id,))
+            row = c.fetchone()
+            if not row:
+                return {"success": False, "msg": "해당 학번으로 가입된 계정이 없습니다."}
+            status = _check_suspension(c, student_id)
+        return {"success": True, "student_id": row[0], "grade": row[1], **status}
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+
+
+def list_sanctioned_users_py(admin_id, is_admin=False):
+    """📌 경고를 받았거나 현재 이용 제한 중인 계정 목록 (관리자 패널용)."""
+    try:
+        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+            return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
+        with db_cursor(commit=True) as c:
+            c.execute('''
+                SELECT student_id, warning_count, is_suspended, suspend_permanent, suspend_until, suspend_reason
+                FROM users WHERE warning_count > 0 OR is_suspended = 1
+                ORDER BY is_suspended DESC, warning_count DESC
+            ''')
+            rows = c.fetchall()
+        users = [{"student_id": r[0], "warning_count": r[1], "suspended": bool(r[2]),
+                  "permanent": bool(r[3]), "until": r[4] or '', "reason": r[5] or ''} for r in rows]
+        return {"success": True, "users": users}
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+
+
 def create_account_py(email, password, agree_privacy=False, agree_terms=False):
     try:
         if not email.endswith('@saerom.hs.kr'):
@@ -522,14 +637,22 @@ def login_py(student_id, password):
         student_id = (student_id or '').strip()
         if student_id == ADMIN_LOGIN_ID and password == ADMIN_LOGIN_PASSWORD:
             return {"success": True, "grade": "admin", "is_admin": True, "msg": "관리자로 로그인되었습니다."}
-        with db_cursor() as c:
+        with db_cursor(commit=True) as c:
             c.execute('SELECT password_hash, grade, is_admin FROM users WHERE student_id = %s', (student_id,))
             row = c.fetchone()
-        if not row:
-            return {"success": False, "msg": "등록된 계정이 없습니다. 먼저 학번 메일 인증으로 계정을 만들어주세요."}
-        if row[0] != _hash_pw(password):
-            return {"success": False, "msg": "비밀번호가 일치하지 않습니다."}
-        return {"success": True, "grade": row[1], "is_admin": bool(row[2]), "msg": "로그인되었습니다."}
+            if not row:
+                return {"success": False, "msg": "등록된 계정이 없습니다. 먼저 학번 메일 인증으로 계정을 만들어주세요."}
+            if row[0] != _hash_pw(password):
+                return {"success": False, "msg": "비밀번호가 일치하지 않습니다."}
+            # 📌 이용 제한(경고/정지) 상태를 함께 내려주어 프론트에서 안내할 수 있게 합니다.
+            status = _check_suspension(c, student_id)
+        result = {"success": True, "grade": row[1], "is_admin": bool(row[2]), "msg": "로그인되었습니다.",
+                  "warning_count": status["warning_count"], "suspended": status["suspended"],
+                  "suspend_permanent": status["permanent"], "suspend_until": status["until"],
+                  "suspend_reason": status["reason"]}
+        if status["suspended"]:
+            result["suspend_msg"] = _suspension_message(status)
+        return result
     except Exception as e:
         return {"success": False, "msg": str(e)}
 
@@ -703,6 +826,11 @@ def add_post_py(title, content, author, author_id, password, gallery, image_url=
         if not title or not content: return {"success": False, "msg": "제목과 내용을 입력하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "글쓰기는 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
+        if not is_admin and author_id != ADMIN_LOGIN_ID:
+            with db_cursor(commit=True) as c:
+                sus = _check_suspension(c, author_id)
+            if sus["suspended"]:
+                return {"success": False, "msg": _suspension_message(sus)}
         if gallery == 'admin_notice' and not is_admin and author_id != ADMIN_LOGIN_ID:
             return {"success": False, "msg": "관리자 채널은 관리자만 작성할 수 있습니다."}
         # 📌 욕설/비하 표현 필터 - 확실한 건 차단, 애매한 건 등록 후 관리자 검수 요청
@@ -873,6 +1001,11 @@ def add_comment_py(post_id, content, author, author_id, password, image_url='', 
         if not content and not image_url: return {"success": False, "msg": "내용이나 사진을 첨부하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "댓글 작성은 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
+        if author_id != ADMIN_LOGIN_ID:
+            with db_cursor(commit=True) as c:
+                sus = _check_suspension(c, author_id)
+            if sus["suspended"]:
+                return {"success": False, "msg": _suspension_message(sus)}
         # 📌 댓글도 동일한 욕설/비하 필터를 거칩니다.
         level, bad_word = check_text_policy(content)
         if level == 'block':
@@ -1177,6 +1310,33 @@ def api_get_admin_logs():
     ))
 
 
+@app.route('/api/apply_user_sanction', methods=['POST'])
+def api_apply_user_sanction():
+    a = _args()
+    return jsonify(apply_user_sanction_py(
+        a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else '',
+        a[2] if len(a) > 2 else '', a[3] if len(a) > 3 else '',
+        bool(a[4]) if len(a) > 4 else False, a[5] if len(a) > 5 else 0
+    ))
+
+
+@app.route('/api/get_user_sanction_status', methods=['POST'])
+def api_get_user_sanction_status():
+    a = _args()
+    return jsonify(get_user_sanction_status_py(
+        a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else '',
+        bool(a[2]) if len(a) > 2 else False
+    ))
+
+
+@app.route('/api/list_sanctioned_users', methods=['POST'])
+def api_list_sanctioned_users():
+    a = _args()
+    return jsonify(list_sanctioned_users_py(
+        a[0] if len(a) > 0 else '', bool(a[1]) if len(a) > 1 else False
+    ))
+
+
 @app.route('/')
 def index():
     return Response(HTML_PAGE, mimetype='text/html')
@@ -1307,6 +1467,8 @@ HTML_PAGE = """
     .consent-box label { display: flex; align-items: flex-start; gap: 4px; margin-bottom: 3px; cursor: pointer; line-height: 1.4; }
     .consent-box input[type=checkbox] { margin: 1px 0 0 0; flex-shrink: 0; }
     .policy-link { color: #534884; text-decoration: underline; cursor: pointer; font-size: 10px; font-weight: bold; }
+    .write-policy-notice { font-size: 9px; color: #7a5200; background: #fff8e6; border: 1px solid #f0d99a; border-radius: 3px; padding: 5px 6px; margin-bottom: 4px; line-height: 1.5; }
+    .write-policy-notice .policy-link { color: #7a5200; font-size: 9px; }
     .badge-hidden { background: #555; color: #fff; font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-right: 2px; font-weight: bold; }
     .log-table { width: 100%; border-collapse: collapse; font-size: 10px; }
     .log-table th { background: #f2f2f2; border-bottom: 1px solid #534884; padding: 4px 3px; text-align: left; white-space: nowrap; }
@@ -1483,6 +1645,12 @@ HTML_PAGE = """
             <input type="text" id="post-author" class="full-input" placeholder="닉네임" value="ㅇㅇ">
             <input type="text" id="post-title" class="full-input" placeholder="제목">
             <textarea id="post-content" placeholder="내용을 입력하세요..." style="height:140px;"></textarea>
+            <!-- 📌 글쓰기 창에 운영정책/커뮤니티 이용규칙을 상기시키는 안내문구 -->
+            <div class="write-policy-notice">
+              ⚠️ 커뮤니티 이용규칙에 어긋나는 글(비방·욕설·허위사실 등)은 <b>사전 고지 없이 삭제</b>될 수 있으며,
+              필요 시 작성자 학번 등의 정보가 <b>학교 측에 제출</b>될 수 있습니다.
+              <span class="policy-link" onclick="openPolicyModal()">운영정책 전문 보기 ▸</span>
+            </div>
             <div style="display:flex; align-items:center; gap:2px; margin-bottom:4px;">
               <span style="font-size:10px; color:#555;">📷 사진:</span>
               <input type="file" id="post-file" accept="image/*" style="font-size:9px; width:100%;">
@@ -1525,14 +1693,6 @@ HTML_PAGE = """
           <div id="pw-set-step" class="hidden" style="margin-top: 4px;">
             <input type="password" class="full-input" id="new-pw" placeholder="사용할 비밀번호 (4자 이상)">
             <input type="password" class="full-input" id="new-pw-confirm" placeholder="비밀번호 확인">
-            <!-- 📌 개인정보 수집·이용 / 운영정책 필수 동의 -->
-            <div class="consent-box">
-              <label><input type="checkbox" id="agree-privacy"><span><b>[필수]</b> 개인정보 수집·이용에 동의합니다.</span></label>
-              <label><input type="checkbox" id="agree-terms"><span><b>[필수]</b> 운영정책(커뮤니티 이용규칙)에 동의합니다.</span></label>
-              <div style="text-align:right; margin-top:2px;">
-                <span class="policy-link" onclick="openPolicyModal()">정책 전문 보기 ▸</span>
-              </div>
-            </div>
             <button class="dc-btn" style="width:100%; background:#27ae60;" onclick="setAccountPassword()">계정 생성 완료</button>
           </div>
           <div id="auth-msg" style="font-size:9px; color:#e74c3c; margin-top:4px; word-break:break-all;"></div>
@@ -1557,6 +1717,7 @@ HTML_PAGE = """
         <button class="dc-btn dc-btn-admin-req" onclick="openAdminReqModal()">관리자에게 요청하기</button>
         <!-- 📌 관리자에게만 보이는 활동 로그 버튼 -->
         <button id="btn-admin-log" class="dc-btn hidden" style="width:100%; background:#534884; margin-top:4px; font-size:11px; padding:6px;" onclick="openAdminLogModal()">🗂️ 관리자 활동 로그</button>
+        <button id="btn-user-sanction" class="dc-btn hidden" style="width:100%; background:#c0392b; margin-top:4px; font-size:11px; padding:6px;" onclick="openUserSanctionModal()">🚫 이용자 제재 관리</button>
         <div style="text-align:center; margin-top:6px;">
           <span class="policy-link" onclick="openPolicyModal()">운영정책 · 개인정보 처리방침</span>
         </div>
@@ -1628,6 +1789,7 @@ HTML_PAGE = """
             <li>특정인을 지목한 비방·저격·조롱, 실명이나 학번 등 신상 공개</li>
             <li>욕설, 혐오·차별 표현, 성적 수치심을 주는 내용</li>
             <li>허위사실 유포, 도배, 무단 광고</li>
+            <li>사실이 아니거나 상대를 괴롭히기 위한 목적의 악의적·반복적 신고 남용</li>
           </ul>
         </li>
         <li><b>자동 조치</b>
@@ -1637,7 +1799,7 @@ HTML_PAGE = """
             <li>애매한 표현은 자동으로 관리자 검수 목록에 올라갑니다.</li>
           </ul>
         </li>
-        <li><b>제재 단계</b> : 1차 경고 및 게시물 삭제 → 2차 일정 기간 이용 제한 → 3차 이용 정지. 학교폭력에 해당하는 중대한 사안은 단계와 무관하게 즉시 학교에 통보합니다.</li>
+        <li><b>제재 단계</b> : 1차 경고 및 게시물 삭제 → 2차 일정 기간 이용 제한 → 3차 이용 정지. 학교폭력에 해당하는 중대한 사안은 단계와 무관하게 즉시 학교에 통보합니다. 악의적인 신고 남용이 반복되는 경우에도 동일한 절차가 적용될 수 있습니다.</li>
         <li><b>신고 방법</b> : 각 게시물과 댓글의 [신고] 버튼을 누르면 관리자에게 즉시 접수됩니다.</li>
       </ul>
       <h4>3. 데이터 보존 정책</h4>
@@ -1648,7 +1810,8 @@ HTML_PAGE = """
       </ul>
       <h4>4. 운영 주체 및 문의</h4>
       <ul>
-        <li>본 서비스는 학생이 자율적으로 운영하는 교내 커뮤니티이며, 문의 및 신고는 사이드바의 [관리자에게 요청하기]를 통해 접수됩니다.</li>
+        <li>본 서비스는 학생이 임의로 단독 운영하는 서비스가 아니며, <b>학생회와 교사가 함께 운영에 참여</b>하여 게시물 관리, 이용자 제재, 학교폭력 등 사안 발생 시 대응을 진행합니다.</li>
+        <li>문의 및 신고는 사이드바의 [관리자에게 요청하기]를 통해 접수되며, 필요한 경우 학생회 및 담당 교사에게 전달됩니다.</li>
       </ul>
     </div>
     <button class="dc-btn" style="width:100%; margin-top:8px; background:#7f8c8d;" onclick="closePolicyModal()">닫기</button>
@@ -1670,6 +1833,76 @@ HTML_PAGE = """
       </table>
     </div>
     <button class="dc-btn" style="width:100%; margin-top:8px; background:#7f8c8d;" onclick="closeAdminLogModal()">닫기</button>
+  </div>
+</div>
+<!-- 📌 계정 생성 전 필수 동의 - 화면 중앙에 모달로 띄웁니다 (구석 체크박스 대신). -->
+<div id="signup-consent-modal" class="modal-backdrop hidden">
+  <div class="modal-box modal-box-wide">
+    <div class="dc-title">📄 계정 생성 전 필수 동의</div>
+    <div class="modal-scroll" id="signup-consent-summary" style="max-height:280px;">
+      <h4>1. 개인정보 수집 · 이용 동의</h4>
+      <ul>
+        <li><b>수집 항목</b> : 학번(학교 이메일), 비밀번호(암호화 저장), 작성한 글·댓글 내용, 작성 시각</li>
+        <li><b>수집 목적</b> : 재학생 본인 확인, 학년별 갤러리 접근 권한 부여, 부적절한 게시물 관리 및 이용자 보호</li>
+        <li><b>제3자 제공</b> : 학교폭력 등 사안 조사를 위한 학교의 공식 요청이 있는 경우, 해당 게시물과 작성자 학번을 제공할 수 있습니다.</li>
+      </ul>
+      <h4>2. 운영정책 (커뮤니티 이용규칙) 핵심 요약</h4>
+      <ul>
+        <li>화면에는 익명으로 표시되지만, <b>모든 글·댓글에는 작성자 학번이 서버에 기록</b>됩니다.</li>
+        <li>특정인 비방·저격, 욕설·혐오 표현, 허위사실 유포는 금지되며, 위반 시 <b>사전 고지 없이 삭제</b>될 수 있습니다.</li>
+        <li>허위·악의적인 신고를 반복하는 경우에도 계정 이용에 영향이 있을 수 있습니다.</li>
+        <li>위반 정도에 따라 경고, 일시적 이용 제한, 영구 이용 정지 조치가 있을 수 있습니다.</li>
+      </ul>
+      <div style="text-align:right;"><span class="policy-link" onclick="openPolicyModal()">전체 정책 원문 보기 ▸</span></div>
+    </div>
+    <!-- 📌 정책을 끝까지 읽었다는 것을 "확인했습니다"를 직접 입력하도록 해서 확인합니다.
+         정확히 입력하기 전까지는 아래 동의 체크박스 자체가 비활성화되어 있습니다. -->
+    <div style="margin-top:8px; font-size:10px; color:#555;">
+      위 내용을 확인하셨다면 아래 칸에 <b>"확인했습니다"</b>라고 입력해주세요.
+    </div>
+    <input type="text" id="consent-confirm-text" class="full-input" placeholder="확인했습니다" style="margin-top:4px;" oninput="onConsentConfirmTextInput()">
+    <div class="consent-box" style="margin-top:4px;">
+      <label><input type="checkbox" id="modal-agree-privacy" disabled><span><b>[필수]</b> 개인정보 수집·이용에 동의합니다.</span></label>
+      <label><input type="checkbox" id="modal-agree-terms" disabled><span><b>[필수]</b> 운영정책(커뮤니티 이용규칙)에 동의합니다.</span></label>
+    </div>
+    <div style="display:flex; gap:4px; margin-top:8px;">
+      <button class="dc-btn" style="flex:1; background:#27ae60;" onclick="confirmSignupConsent()">동의하고 계정 생성</button>
+      <button class="dc-btn" style="flex:1; background:#7f8c8d;" onclick="closeSignupConsentModal()">취소</button>
+    </div>
+  </div>
+</div>
+<!-- 📌 관리자 전용 - 이용자 제재(경고/일시정지/영구정지/해제) 관리 -->
+<div id="user-sanction-modal" class="modal-backdrop hidden">
+  <div class="modal-box modal-box-wide">
+    <div class="dc-title">🚫 이용자 제재 관리</div>
+    <div style="margin-bottom:6px;">
+      <label style="font-size:10px; font-weight:bold; color:#555;">대상 학번</label>
+      <div style="display:flex; gap:4px;">
+        <input type="text" id="sanction-student-id" class="full-input" placeholder="예: 2610101" style="margin-bottom:0;">
+        <button class="dc-btn" style="flex-shrink:0; background:#534884;" onclick="lookupSanctionUser()">조회</button>
+      </div>
+    </div>
+    <div id="sanction-user-status" style="font-size:10px; color:#666; margin-bottom:6px; padding:6px; background:#f8f9fa; border-radius:3px;">
+      학번을 입력하고 조회를 눌러주세요.
+    </div>
+    <div style="margin-bottom:6px;">
+      <label style="font-size:10px; font-weight:bold; color:#555;">사유</label>
+      <textarea id="sanction-reason" style="height:44px;" placeholder="제재/해제 사유를 입력하세요."></textarea>
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:8px;">
+      <button class="dc-btn btn-compact" style="background:#f39c12;" onclick="applySanction('경고')">⚠️ 경고</button>
+      <button class="dc-btn btn-compact" style="background:#e67e22;" onclick="applySanction('일시정지_7')">⏸️ 일시정지(7일)</button>
+      <button class="dc-btn btn-compact" style="background:#e67e22;" onclick="applySanction('일시정지_30')">⏸️ 일시정지(30일)</button>
+      <button class="dc-btn btn-compact dc-btn-danger" onclick="applySanction('영구정지')">🚫 영구정지</button>
+      <button class="dc-btn btn-compact" style="background:#27ae60;" onclick="applySanction('해제')">✅ 제한 해제</button>
+    </div>
+    <div class="modal-scroll" style="max-height:180px;">
+      <table class="log-table">
+        <thead><tr><th>학번</th><th>경고</th><th>상태</th><th>해제일</th><th>사유</th></tr></thead>
+        <tbody id="sanction-list-body"><tr><td colspan="5" style="color:#888; padding:10px;">불러오는 중...</td></tr></tbody>
+      </table>
+    </div>
+    <button class="dc-btn" style="width:100%; margin-top:8px; background:#7f8c8d;" onclick="closeUserSanctionModal()">닫기</button>
   </div>
 </div>
 <script>
@@ -1773,23 +2006,54 @@ HTML_PAGE = """
     document.getElementById('signup-box').classList.toggle('hidden');
   }
   // 📌 이메일 인증 완료 후 비밀번호를 설정해 계정을 생성 (다음부터는 이메일 인증 없이 로그인만으로 이용 가능)
+  // 📌 비밀번호까지 확인되면, 동의는 사이드바 구석 체크박스가 아니라
+  //    화면 중앙 모달로 띄워서 놓치지 않게 합니다. 실제 계정 생성은
+  //    모달에서 "확인했습니다" 입력 + 체크 후 confirmSignupConsent()에서 처리합니다.
+  let _pendingSignup = null;
   function setAccountPassword() {
     const email = document.getElementById('email').value.trim();
     const pw1 = document.getElementById('new-pw').value;
     const pw2 = document.getElementById('new-pw-confirm').value;
-    const msgDiv = document.getElementById('auth-msg');
     if (!pw1 || pw1.length < 4) { alert("비밀번호는 4자 이상 입력해주세요."); return; }
     if (pw1 !== pw2) { alert("비밀번호가 일치하지 않습니다."); return; }
-    // 📌 개인정보 수집·이용 / 운영정책 동의는 필수입니다.
-    const agreePrivacy = document.getElementById('agree-privacy').checked;
-    const agreeTerms = document.getElementById('agree-terms').checked;
-    if (!agreePrivacy || !agreeTerms) {
-      alert("개인정보 수집·이용 및 운영정책에 모두 동의해야 계정을 만들 수 있습니다.\\n[정책 전문 보기]에서 내용을 확인할 수 있습니다.");
+    _pendingSignup = { email, pw1 };
+    document.getElementById('consent-confirm-text').value = '';
+    const cb1 = document.getElementById('modal-agree-privacy');
+    const cb2 = document.getElementById('modal-agree-terms');
+    cb1.checked = false; cb2.checked = false;
+    cb1.disabled = true; cb2.disabled = true;
+    document.getElementById('signup-consent-summary').scrollTop = 0;
+    document.getElementById('signup-consent-modal').classList.remove('hidden');
+  }
+  // 📌 "확인했습니다"를 정확히 입력해야만 동의 체크박스가 눌려지도록 잠금을 풉니다.
+  //    입력값이 틀리거나 지워지면 다시 체크 해제 + 잠금됩니다(대충 입력 후 지우고 우회 방지).
+  function onConsentConfirmTextInput() {
+    const ok = document.getElementById('consent-confirm-text').value.trim() === '확인했습니다';
+    const cb1 = document.getElementById('modal-agree-privacy');
+    const cb2 = document.getElementById('modal-agree-terms');
+    cb1.disabled = !ok;
+    cb2.disabled = !ok;
+    if (!ok) { cb1.checked = false; cb2.checked = false; }
+  }
+  function closeSignupConsentModal() {
+    document.getElementById('signup-consent-modal').classList.add('hidden');
+    _pendingSignup = null;
+  }
+  function confirmSignupConsent() {
+    if (!_pendingSignup) return;
+    const confirmTextOk = document.getElementById('consent-confirm-text').value.trim() === '확인했습니다';
+    const agreePrivacy = document.getElementById('modal-agree-privacy').checked;
+    const agreeTerms = document.getElementById('modal-agree-terms').checked;
+    if (!confirmTextOk || !agreePrivacy || !agreeTerms) {
+      alert('내용을 확인한 뒤 "확인했습니다"를 입력하고, 두 항목 모두 동의해야 계정을 만들 수 있습니다.');
       return;
     }
+    const { email, pw1 } = _pendingSignup;
+    const msgDiv = document.getElementById('auth-msg');
     google.colab.kernel.invokeFunction('notebook.create_account', [email, pw1, agreePrivacy, agreeTerms], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
+        closeSignupConsentModal();
         const studentId = email.split('@')[0];
         localStorage.setItem('saerom_verified_grade', res.grade);
         localStorage.setItem('saerom_is_admin', res.is_admin ? 'true' : 'false');
@@ -1797,6 +2061,7 @@ HTML_PAGE = """
         applyGradeUI(res.grade, res.is_admin);
         alert(`계정이 생성되어 로그인되었습니다!${res.is_admin ? ' [👑 관리자 권한 부여됨]' : ''}`);
       } else {
+        closeSignupConsentModal();
         msgDiv.style.color = "#e74c3c";
         msgDiv.innerText = res.msg;
       }
@@ -1815,6 +2080,12 @@ HTML_PAGE = """
         localStorage.setItem('saerom_is_admin', res.is_admin ? 'true' : 'false');
         localStorage.setItem('saerom_student_id', id);
         applyGradeUI(res.grade, res.is_admin);
+        // 📌 이용 제한(경고/정지) 상태가 있으면 로그인 직후 안내합니다.
+        if (res.suspended) {
+          alert('⚠️ ' + res.suspend_msg);
+        } else if (res.warning_count > 0) {
+          alert(`⚠️ 현재 누적 경고 ${res.warning_count}회가 있습니다. 운영정책을 다시 확인해주세요.`);
+        }
       } else {
         msgDiv.innerText = res.msg;
       }
@@ -1933,6 +2204,83 @@ HTML_PAGE = """
           <td>${escapeHtml(l.action || '')}</td>
           <td>${escapeHtml(l.target_type || '')}${l.target_id ? ' #' + l.target_id : ''}</td>
           <td>${escapeHtml(l.detail || '')}</td>
+        </tr>`;
+      });
+    });
+  }
+  // 📌 이용자 제재(경고/일시정지/영구정지/해제) 관리 모달 (관리자 전용)
+  function openUserSanctionModal() {
+    if (!amIAdmin()) { alert("관리자만 사용할 수 있는 기능입니다."); return; }
+    document.getElementById('user-sanction-modal').classList.remove('hidden');
+    document.getElementById('sanction-user-status').innerHTML = '학번을 입력하고 조회를 눌러주세요.';
+    loadSanctionList();
+  }
+  function closeUserSanctionModal() {
+    document.getElementById('user-sanction-modal').classList.add('hidden');
+  }
+  function lookupSanctionUser() {
+    const sid = document.getElementById('sanction-student-id').value.trim();
+    const statusBox = document.getElementById('sanction-user-status');
+    if (!sid) { alert("학번을 입력하세요."); return; }
+    statusBox.innerHTML = '조회 중...';
+    google.colab.kernel.invokeFunction('notebook.get_user_sanction_status', [sid, getMyUserId(), amIAdmin()], {}).then(obj => {
+      const res = parseRes(obj);
+      if (!res.success) {
+        statusBox.innerHTML = `<span style="color:#e74c3c;">${escapeHtml(res.msg || '조회하지 못했습니다.')}</span>`;
+        return;
+      }
+      let stateTxt = '정상 이용 중';
+      if (res.suspended) {
+        stateTxt = res.permanent ? '<b style="color:#c0392b;">영구 정지</b>' : `<b style="color:#e67e22;">일시 정지</b> (~${escapeHtml(res.until)})`;
+      }
+      statusBox.innerHTML = `학번 <b>${escapeHtml(res.student_id)}</b> (${escapeHtml(String(res.grade))}학년) — 누적 경고 ${res.warning_count}회 / 상태: ${stateTxt}` +
+        (res.reason ? ` / 최근 사유: ${escapeHtml(res.reason)}` : '');
+    });
+  }
+  function applySanction(actionKey) {
+    if (!amIAdmin()) { alert("관리자만 사용할 수 있는 기능입니다."); return; }
+    const sid = document.getElementById('sanction-student-id').value.trim();
+    const reason = document.getElementById('sanction-reason').value.trim();
+    if (!sid) { alert("학번을 입력하세요."); return; }
+    let action = actionKey, days = 0;
+    if (actionKey.startsWith('일시정지_')) {
+      action = '일시정지';
+      days = parseInt(actionKey.split('_')[1], 10) || 7;
+    }
+    const labelMap = { '경고': '경고를 부여', '일시정지': `${days}일 이용 정지`, '영구정지': '영구 정지', '해제': '이용 제한을 해제' };
+    if (!confirm(`학번 ${sid}에게 ${labelMap[action] || action} 처리를 하시겠습니까?`)) return;
+    google.colab.kernel.invokeFunction('notebook.apply_user_sanction', [sid, action, reason, getMyUserId(), amIAdmin(), days], {}).then(obj => {
+      const res = parseRes(obj);
+      alert(res.msg || '처리되었습니다.');
+      if (res.success) {
+        lookupSanctionUser();
+        loadSanctionList();
+      }
+    });
+  }
+  function loadSanctionList() {
+    const body = document.getElementById('sanction-list-body');
+    body.innerHTML = '<tr><td colspan="5" style="color:#888; padding:10px;">불러오는 중...</td></tr>';
+    google.colab.kernel.invokeFunction('notebook.list_sanctioned_users', [getMyUserId(), amIAdmin()], {}).then(obj => {
+      const res = parseRes(obj);
+      if (!res.success) {
+        body.innerHTML = `<tr><td colspan="5" style="color:#e74c3c; padding:10px;">${escapeHtml(res.msg || '불러오지 못했습니다.')}</td></tr>`;
+        return;
+      }
+      if (!res.users.length) {
+        body.innerHTML = '<tr><td colspan="5" style="color:#888; padding:10px;">경고·제한 이력이 있는 계정이 없습니다.</td></tr>';
+        return;
+      }
+      body.innerHTML = '';
+      res.users.forEach(u => {
+        let stateTxt = '-';
+        if (u.suspended) stateTxt = u.permanent ? '영구정지' : '일시정지';
+        body.innerHTML += `<tr>
+          <td>${escapeHtml(u.student_id)}</td>
+          <td>${u.warning_count}</td>
+          <td>${stateTxt}</td>
+          <td>${escapeHtml(u.permanent ? '-' : (u.until || '-'))}</td>
+          <td>${escapeHtml(u.reason || '-')}</td>
         </tr>`;
       });
     });
@@ -2240,6 +2588,8 @@ HTML_PAGE = """
     // 📌 관리자 활동 로그 버튼도 관리자에게만 보입니다.
     const logBtn = document.getElementById('btn-admin-log');
     if (logBtn) logBtn.classList.toggle('hidden', !isAdmin);
+    const sanctionBtn = document.getElementById('btn-user-sanction');
+    if (sanctionBtn) sanctionBtn.classList.toggle('hidden', !isAdmin);
   }
   function loadAdBanner(slot) {
     google.colab.kernel.invokeFunction('notebook.get_ad_banner', [slot], {}).then(obj => {
@@ -2600,7 +2950,7 @@ HTML_PAGE = """
   function reportCurrentPost() {
     if (!currentPostId) return;
     if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
-    const reason = prompt("게시글 신고 사유를 입력하세요:");
+    const reason = prompt("게시글 신고 사유를 입력하세요:\n(※ 사실이 아니거나 악의적인 신고가 반복되면 계정 이용에 영향이 있을 수 있으니, 신중하게 이용해주세요.)");
     if (!reason || !reason.trim()) return;
     google.colab.kernel.invokeFunction('notebook.report_item', ['게시글', currentPostId, reason.trim(), getMyUserId()], {}).then(obj => {
       const res = parseRes(obj);
@@ -2610,7 +2960,7 @@ HTML_PAGE = """
   }
   function reportComment(commentId) {
     if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
-    const reason = prompt("댓글 신고 사유를 입력하세요:");
+    const reason = prompt("댓글 신고 사유를 입력하세요:\n(※ 사실이 아니거나 악의적인 신고가 반복되면 계정 이용에 영향이 있을 수 있으니, 신중하게 이용해주세요.)");
     if (!reason || !reason.trim()) return;
     google.colab.kernel.invokeFunction('notebook.report_item', ['댓글', commentId, reason.trim(), getMyUserId()], {}).then(obj => {
       const res = parseRes(obj);
