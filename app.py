@@ -1,11 +1,12 @@
-import os
+\import os
+import re
 import json
 import random
 import hashlib
 import base64
 import requests
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg2
 from psycopg2 import pool as pg_pool
@@ -32,6 +33,12 @@ ADMIN_LOGIN_PASSWORD = os.environ.get("ADMIN_LOGIN_PASSWORD", "qwerty4321!")
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onlysaerom1@gmail.com")
 SENDER_NAME = os.environ.get("SENDER_NAME", "온리새롬 갤러리")
+
+# 📌 운영 정책 관련 설정값
+#    REPORT_HIDE_THRESHOLD: 서로 다른 사용자 몇 명이 신고하면 자동으로 숨길지
+#    DATA_RETENTION_DAYS:   삭제된 글/댓글 원문을 며칠간 보관 후 자동 파기할지
+REPORT_HIDE_THRESHOLD = int(os.environ.get("REPORT_HIDE_THRESHOLD", "3"))
+DATA_RETENTION_DAYS = int(os.environ.get("DATA_RETENTION_DAYS", "90"))
 
 
 def send_mail_via_brevo(to_emails, subject, body_text):
@@ -154,13 +161,54 @@ def init_db():
             value TEXT
         )
         ''')
+        # 📌 관리자 활동 로그: 누가(관리자) 언제 어떤 글/댓글을 삭제·숨김·복구했는지 남깁니다.
+        #    학교 측 감사나 학폭 사안 조사 시 "관리가 어떻게 이뤄졌는지" 소명하는 근거가 됩니다.
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id SERIAL PRIMARY KEY,
+            admin_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_type TEXT DEFAULT '',
+            target_id INTEGER,
+            detail TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        ''')
+        # 📌 데이터 보존: 삭제된 글/댓글의 원문을 정해진 기간(DATA_RETENTION_DAYS)만 보관합니다.
+        #    "삭제하면 증거가 사라진다"는 우려를 없애면서, 기간이 지나면 자동 파기되어
+        #    필요 이상으로 오래 들고 있지 않도록 합니다.
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS deleted_archive (
+            id SERIAL PRIMARY KEY,
+            target_type TEXT NOT NULL,
+            target_id INTEGER,
+            post_id INTEGER,
+            author_id TEXT DEFAULT '',
+            author TEXT DEFAULT '',
+            title TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            gallery TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            deleted_by TEXT DEFAULT '',
+            deleted_at TEXT NOT NULL,
+            reason TEXT DEFAULT ''
+        )
+        ''')
         for col, coltype in [("author_id", "TEXT DEFAULT '101'"), ("is_concept", "INTEGER DEFAULT 0"),
                               ("grade", "TEXT DEFAULT '1'"), ("gallery", "TEXT DEFAULT 'all'"),
-                              ("image_url", "TEXT DEFAULT ''"), ("views", "INTEGER DEFAULT 0")]:
+                              ("image_url", "TEXT DEFAULT ''"), ("views", "INTEGER DEFAULT 0"),
+                              ("is_hidden", "INTEGER DEFAULT 0")]:
             c.execute(f"ALTER TABLE posts ADD COLUMN IF NOT EXISTS {col} {coltype}")
         for col, coltype in [("author_id", "TEXT DEFAULT '101'"), ("image_url", "TEXT DEFAULT ''"),
-                              ("parent_id", "INTEGER DEFAULT NULL")]:
+                              ("parent_id", "INTEGER DEFAULT NULL"), ("is_hidden", "INTEGER DEFAULT 0")]:
             c.execute(f"ALTER TABLE comments ADD COLUMN IF NOT EXISTS {col} {coltype}")
+        # 📌 같은 사람이 여러 번 신고해서 글을 숨겨버리는 걸 막기 위해 신고자 학번을 기록합니다.
+        #    (자동 숨김 판정은 "서로 다른 신고자 수" 기준으로 합니다.)
+        for col, coltype in [("reporter_id", "TEXT DEFAULT ''")]:
+            c.execute(f"ALTER TABLE reports ADD COLUMN IF NOT EXISTS {col} {coltype}")
+        # 📌 가입 시 받은 동의 기록(개인정보 수집·이용 / 운영정책). 동의 시각을 남겨둡니다.
+        for col, coltype in [("privacy_agreed_at", "TEXT DEFAULT ''"), ("terms_agreed_at", "TEXT DEFAULT ''")]:
+            c.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {coltype}")
         # 📌 관리자 권한은 이메일 인증 계정이 아닌 별도의 관리자 로그인(ADMIN_LOGIN_ID)으로만 부여됩니다.
         c.execute("UPDATE users SET is_admin = 0")
         # 📌 글/댓글이 쌓일수록 gallery, is_concept로 걸러내거나 댓글 수를 세는 쿼리가
@@ -172,9 +220,220 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_is_concept ON posts(is_concept)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_author_id ON posts(author_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_type, target_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)")
 
 
 init_db()
+
+
+# ==========================================
+# 📌 0-2. 욕설 / 집단 비하 표현 필터
+#
+#   [설계 의도]
+#   - "씨@발", "씨1발", "씨*발"처럼 특수문자·숫자로 끊어 쓰는 우회는 잡아야 하고,
+#     "씨앗을 심고 발로 흙을 덮었다" 같은 정상 문장은 걸리면 안 됩니다.
+#   - 그래서 "한글이 아닌 문자(특수문자/숫자/영문/이모지)만" 지우고 한글 글자는
+#     그대로 둔 상태로 검사합니다. 위 정상 문장은 "씨앗을심고발로흙을덮었다"가 되어
+#     '씨발'이라는 연속된 글자가 만들어지지 않으므로 걸리지 않습니다.
+#   - 띄어쓰기까지 지우면 "무시 발언" → "무시발언"처럼 멀쩡한 말이 걸릴 수 있습니다.
+#     그래서 띄어쓰기를 지운 뒤에야 걸리는 경우(예: "씨 발")는 차단하지 않고
+#     '관리자 검수 대상'으로만 자동 표시합니다. 차단은 확실한 것만 합니다.
+#   - 어떤 필터도 100% 걸러내지는 못합니다(은어·초성·신조어는 계속 생깁니다).
+#     그래서 이 필터는 "1차 방어선"이고, 신고 누적 자동 숨김 + 관리자 검수가
+#     2차·3차 방어선입니다.
+# ==========================================
+
+# 📌 확실한 욕설/비하 표현 → 등록 자체를 차단합니다.
+PROFANITY_BLOCK_WORDS = [
+    # 욕설 (표기 변형 포함)
+    "씨발", "씨빨", "씨팔", "씨벌", "씨바", "시발", "시팔", "시벌", "시바",
+    "쓰발", "스발", "슈발", "십새", "씹새", "씹창", "씹할", "씹년", "씹놈",
+    "좆", "좃", "좇같", "존나", "존내", "죤나", "졸라",
+    "병신", "빙신", "븅신", "병싄", "지랄", "지럴",
+    "니미", "느금마", "느검마", "니애미", "니애비", "애미뒤", "애비뒤",
+    "개새끼", "개색기", "개세끼", "개쉐이", "쌔끼", "새끼야",
+    "이새끼", "저새끼", "그새끼", "니새끼", "미친놈", "미친년", "미친새끼",
+    "썅", "썅놈", "썅년", "쌍놈", "쌍년", "등신", "머저리", "찐따", "찌질이",
+    "창녀", "창년", "걸레년", "뒈져", "뒈지", "닥쳐라", "닥치라",
+    # 초성체 ("ㅗ"는 'ㅗㅜㅑ' 같은 정상 표현과 겹쳐서 일부러 넣지 않았습니다)
+    "ㅅㅂ", "ㅆㅂ", "ㅄ", "ㅂㅅ", "ㅈㄹ",
+    # 특정 집단 비하
+    "짱깨", "짱께", "쪽바리", "쪽발이", "깜둥이", "흑형",
+    "김치녀", "된장녀", "한남충", "한녀충", "김치남",
+    "틀딱", "틀딲", "급식충", "맘충", "잼민이",
+    "장애인새끼", "애자새끼", "정신병자새끼", "저능아", "지진아",
+]
+
+# 📌 차단까지는 애매하지만 관리자가 한 번 봐야 하는 표현 → 등록은 되고 검수 목록에 올라갑니다.
+#    ("미친", "꺼져", "더럽" 같은 말은 일상 대화에서 너무 자주 쓰여서
+#     검수 목록만 지저분해지므로 일부러 넣지 않았습니다.)
+PROFANITY_REVIEW_WORDS = [
+    "재수없", "정신병자", "벙어리", "귀머거리", "절름발이",
+    "왕따", "냄새나", "역겹", "토나와", "혐오스", "꺼지라",
+]
+
+# 📌 위 단어를 포함하지만 실제로는 욕이 아닌 정상 표현.
+#    검사 전에 먼저 지워서 억울하게 걸리는 걸 막습니다.
+PROFANITY_EXCEPTIONS = [
+    "시발점", "시발역", "시발자동차", "시발택시", "시발년도",
+    "시바견", "시바이누", "졸라매", "졸라맨",
+    "한남동", "한남대", "한남고", "한남초", "한남중",
+    "등신대", "미친듯", "미친 듯",
+]
+
+# 📌 영어 욕설은 단어 경계(\b)로만 잡습니다.
+#    이렇게 하면 "class hit"이 "shit"으로 오인되는 일이 없고,
+#    "f*ck", "s h i t" 같은 우회 표기는 잡힙니다.
+ENGLISH_PROFANITY = [
+    "fuck", "shit", "bitch", "asshole", "bastard", "cunt",
+    "faggot", "nigger", "retard", "motherfucker",
+]
+
+_NON_HANGUL_RE = re.compile(r'[^가-힣ㄱ-ㅎㅏ-ㅣ\s]')
+_MULTISPACE_RE = re.compile(r'\s+')
+# 📌 띄어쓰기를 지웠을 때 흔히 생기는 오탐("무시 발언" → "무시발언")을 미리 제거합니다.
+_COLLOCATION_RE = re.compile(
+    r'(무시|역시|혹시|다시|하시|되시|계시|드시|보시|주시|가시|오시|이시|잠시|당시|즉시|응시|의시)'
+    r'(발표|발언|발생|발견|발전|발달|발음|발목|발자국|발사|발행|발산|발문|발열|발권)'
+)
+
+
+def _normalize_for_filter(text, strip_spaces=False):
+    """한글이 아닌 문자(특수문자/숫자/영문/이모지)를 지워 우회 표기를 원래 형태로 되돌립니다."""
+    t = _NON_HANGUL_RE.sub('', (text or ''))
+    if strip_spaces:
+        t = _MULTISPACE_RE.sub('', t)
+        t = _COLLOCATION_RE.sub('', t)
+    else:
+        t = _MULTISPACE_RE.sub(' ', t)
+    for ex in PROFANITY_EXCEPTIONS:
+        ex_norm = _NON_HANGUL_RE.sub('', ex)
+        if strip_spaces:
+            ex_norm = _MULTISPACE_RE.sub('', ex_norm)
+        if ex_norm and ex_norm in t:
+            t = t.replace(ex_norm, ' ')
+    return t
+
+
+def _find_english_profanity(text):
+    """단어 경계(\\b) 안에서만 검사하되, 글자 사이에 낀 기호("s.h.i.t")와
+    글자 자리를 기호/숫자로 대신한 표기("f*ck", "b1tch")까지 잡습니다.
+    첫 글자는 실제 알파벳이어야 하므로 "class hit"이 shit으로 오인되지 않습니다."""
+    low = (text or '').lower()
+    for w in ENGLISH_PROFANITY:
+        parts = [w[0] + '+']
+        for ch in w[1:]:
+            parts.append(r'[\W_]*(?:' + ch + r'+|[\W_\d])')
+        pattern = r'\b' + ''.join(parts) + r'\b'
+        if re.search(pattern, low):
+            return w
+    return None
+
+
+def check_text_policy(text):
+    """글/댓글 내용을 검사합니다.
+    반환값: (level, word)
+      - ('block', 단어)  : 확실한 욕설/비하 → 등록 차단
+      - ('review', 단어) : 애매함 → 등록은 되지만 관리자 검수 대상으로 자동 표시
+      - (None, None)     : 문제 없음
+    """
+    if not text:
+        return None, None
+    eng = _find_english_profanity(text)
+    if eng:
+        return 'block', eng
+    tight = _normalize_for_filter(text, strip_spaces=False)
+    for w in PROFANITY_BLOCK_WORDS:
+        if w in tight:
+            return 'block', w
+    for w in PROFANITY_REVIEW_WORDS:
+        if w in tight:
+            return 'review', w
+    # 띄어쓰기를 지워야만 걸리는 경우는 오탐 가능성이 있어 차단하지 않고 검수만 요청합니다.
+    loose = _normalize_for_filter(text, strip_spaces=True)
+    for w in PROFANITY_BLOCK_WORDS:
+        if w in loose:
+            return 'review', w
+    return None, None
+
+
+PROFANITY_BLOCK_MSG = ("욕설 또는 비하 표현이 포함되어 있어 등록할 수 없습니다. "
+                       "내용을 수정한 뒤 다시 시도해주세요. (운영정책 위반)")
+
+
+# ==========================================
+# 📌 0-3. 관리자 활동 로그 / 신고 누적 자동 숨김 / 데이터 보존
+# ==========================================
+def _write_admin_log(c, admin_id, action, target_type='', target_id=None, detail=''):
+    """관리 행위(삭제/숨김/복구 등)를 기록합니다. 학교 감사·학폭 조사 시 소명 근거가 됩니다."""
+    c.execute('''
+        INSERT INTO admin_logs (admin_id, action, target_type, target_id, detail, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    ''', (admin_id or 'UNKNOWN', action, target_type or '', target_id,
+          (detail or '')[:500], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def _target_table(target_type):
+    t = (target_type or '').strip().lower()
+    if '댓글' in (target_type or '') or t == 'comment':
+        return 'comments'
+    if '게시글' in (target_type or '') or t in ('post', 'article'):
+        return 'posts'
+    return None
+
+
+def _maybe_auto_hide(c, target_type, target_id):
+    """📌 서로 다른 사용자 REPORT_HIDE_THRESHOLD명 이상이 신고하면 자동으로 비공개 처리합니다.
+    같은 사람이 여러 번 신고해도 1명으로 계산하므로, 혼자서 글을 내려버릴 수 없습니다."""
+    table = _target_table(target_type)
+    if not table or not target_id:
+        return False
+    c.execute("SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE target_type = %s AND target_id = %s AND reporter_id <> ''",
+              (target_type, target_id))
+    row = c.fetchone()
+    reporters = row[0] if row and row[0] else 0
+    if reporters < REPORT_HIDE_THRESHOLD:
+        return False
+    c.execute(f'SELECT is_hidden FROM {table} WHERE id = %s', (target_id,))
+    cur = c.fetchone()
+    if not cur or cur[0]:
+        return False
+    c.execute(f'UPDATE {table} SET is_hidden = 1 WHERE id = %s', (target_id,))
+    _write_admin_log(c, 'SYSTEM', '자동 숨김', target_type, target_id,
+                     f'서로 다른 신고자 {reporters}명 누적 (기준 {REPORT_HIDE_THRESHOLD}명)')
+    return True
+
+
+def _record_auto_flag(c, target_type, target_id, word):
+    """📌 필터가 '애매함'으로 판정한 글/댓글을 관리자 검수 목록(신고 내역)에 자동 등록합니다.
+    시스템 신고는 1명분으로만 계산되므로, 이것만으로 글이 숨겨지지는 않습니다."""
+    if not target_id:
+        return
+    c.execute('''
+        INSERT INTO reports (target_type, target_id, reason, created_at, reporter_id)
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (target_type, target_id, f'[자동 필터] 검수 필요 표현 감지: {word}',
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'SYSTEM'))
+
+
+def _archive_deleted(c, target_type, row_dict, deleted_by, reason=''):
+    """📌 삭제된 글/댓글 원문을 보존 기간 동안만 따로 보관합니다."""
+    c.execute('''
+        INSERT INTO deleted_archive
+            (target_type, target_id, post_id, author_id, author, title, content, gallery,
+             created_at, deleted_by, deleted_at, reason)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ''', (target_type, row_dict.get('id'), row_dict.get('post_id'), row_dict.get('author_id', ''),
+          row_dict.get('author', ''), row_dict.get('title', ''), row_dict.get('content', ''),
+          row_dict.get('gallery', ''), row_dict.get('created_at', ''), deleted_by or '',
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), reason))
+
+
+def _purge_expired_archive(c):
+    """📌 보존 기간(DATA_RETENTION_DAYS)이 지난 보관 자료를 자동 파기합니다."""
+    cutoff = (datetime.now() - timedelta(days=DATA_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('DELETE FROM deleted_archive WHERE deleted_at < %s', (cutoff,))
 
 
 # ==========================================
@@ -222,12 +481,16 @@ def _is_verified_user(student_id):
         return False
 
 
-def create_account_py(email, password):
+def create_account_py(email, password, agree_privacy=False, agree_terms=False):
     try:
         if not email.endswith('@saerom.hs.kr'):
             return {"success": False, "msg": "새롬고 이메일(@saerom.hs.kr)만 사용 가능합니다."}
         if not password or len(password) < 4:
             return {"success": False, "msg": "비밀번호는 4자 이상 입력해주세요."}
+        # 📌 개인정보 수집·이용 동의와 운영정책 동의는 필수입니다.
+        #    동의 시각을 DB에 남겨두어, 나중에 "사전 고지 및 동의가 있었는지" 확인할 수 있게 합니다.
+        if not agree_privacy or not agree_terms:
+            return {"success": False, "msg": "개인정보 수집·이용 및 운영정책에 모두 동의해야 계정을 만들 수 있습니다."}
         student_id = email.split('@')[0]
         prefix = student_id[:2]
         is_admin = False
@@ -235,17 +498,20 @@ def create_account_py(email, password):
         elif prefix == "25": assigned_grade = "2"
         elif prefix == "24": assigned_grade = "3"
         else: return {"success": False, "msg": "인증 불가: 24(3학년), 25(2학년), 26(1학년) 학번만 가능합니다."}
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with db_cursor(commit=True) as c:
             c.execute('''
-                INSERT INTO users (student_id, password_hash, grade, is_admin, created_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO users (student_id, password_hash, grade, is_admin, created_at, privacy_agreed_at, terms_agreed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (student_id) DO UPDATE SET
                     password_hash = EXCLUDED.password_hash,
                     grade = EXCLUDED.grade,
                     is_admin = EXCLUDED.is_admin,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    privacy_agreed_at = EXCLUDED.privacy_agreed_at,
+                    terms_agreed_at = EXCLUDED.terms_agreed_at
             ''', (student_id, _hash_pw(password), assigned_grade, 1 if is_admin else 0,
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  now_str, now_str, now_str))
         return {"success": True, "grade": assigned_grade, "is_admin": is_admin, "msg": "계정이 생성되었습니다."}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -306,10 +572,14 @@ def send_admin_request_py(req_category, sender_contact, content):
         return {"success": False, "msg": f"발송 중 오류 발생: {str(e)}"}
 
 
-def get_posts_py(tab_type='all', sort_type='date', gallery_type='all', search_kw=''):
+def get_posts_py(tab_type='all', sort_type='date', gallery_type='all', search_kw='', is_admin=False):
     try:
         conditions = []
         params = []
+        # 📌 신고 누적으로 숨김 처리된 글은 목록에서 빠집니다.
+        #    관리자는 검토를 위해 목록에서 볼 수 있고, 화면에 [숨김] 표시가 붙습니다.
+        if not is_admin:
+            conditions.append("is_hidden = 0")
         if tab_type == 'concept':
             conditions.append("is_concept = 1")
             if gallery_type == 'all_global':
@@ -334,9 +604,10 @@ def get_posts_py(tab_type='all', sort_type='date', gallery_type='all', search_kw
         else: order_clause = "ORDER BY id DESC"
         query = f"""
         SELECT id, title, author, author_id, created_at,
-               (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) AS comment_count,
+               (SELECT COUNT(*) FROM comments WHERE post_id = posts.id AND is_hidden = 0) AS comment_count,
                upvotes, is_concept, grade, gallery, image_url,
-               ROW_NUMBER() OVER (PARTITION BY gallery ORDER BY id ASC) AS local_id
+               ROW_NUMBER() OVER (PARTITION BY gallery ORDER BY id ASC) AS local_id,
+               is_hidden
         FROM posts {where_clause} {order_clause}
         """
         with db_cursor() as c:
@@ -350,7 +621,7 @@ def get_posts_py(tab_type='all', sort_type='date', gallery_type='all', search_kw
                 "id": r[0], "title": r[1], "author": r[2], "author_id": r[3],
                 "date": date_str, "comment_count": r[5], "upvotes": r[6],
                 "is_concept": r[7], "grade": r[8], "gallery": r[9], "has_image": bool(r[10]),
-                "local_id": r[11]
+                "local_id": r[11], "is_hidden": r[12]
             })
         return {"success": True, "posts": posts}
     except Exception as e:
@@ -365,12 +636,13 @@ def get_home_summary_py():
     #    프론트도 API를 1번만 부르도록 합쳤습니다.
     try:
         def fetch_category(c, where_sql, limit=4):
+            # 📌 신고 누적으로 자동 숨김된 글(is_hidden = 1)은 홈 화면에 노출하지 않습니다.
             q = f"""
             SELECT id, title, author, created_at,
-                   (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) AS comment_count,
+                   (SELECT COUNT(*) FROM comments WHERE post_id = posts.id AND is_hidden = 0) AS comment_count,
                    upvotes, is_concept, gallery,
                    ROW_NUMBER() OVER (PARTITION BY gallery ORDER BY id ASC) AS local_id
-            FROM posts {where_sql} ORDER BY id DESC LIMIT {limit}
+            FROM posts {where_sql} AND is_hidden = 0 ORDER BY id DESC LIMIT {limit}
             """
             c.execute(q)
             rows = c.fetchall()
@@ -392,29 +664,34 @@ def get_home_summary_py():
         return {"success": False, "msg": str(e)}
 
 
-def get_post_detail_py(post_id, increment_view=True):
+def get_post_detail_py(post_id, increment_view=True, is_admin=False):
     try:
         with db_cursor(commit=True) as c:
             # 📌 조회수는 사용자가 글을 처음 열 때만 올라가야 하므로, 5초마다 도는
             #    실시간 댓글/추천수 폴링 요청(increment_view=False)에서는 올리지 않습니다.
             if increment_view:
                 c.execute('UPDATE posts SET views = views + 1 WHERE id = %s', (post_id,))
-            c.execute('SELECT id, title, content, author, author_id, created_at, upvotes, downvotes, is_concept, grade, gallery, image_url, views FROM posts WHERE id = %s', (post_id,))
+            c.execute('SELECT id, title, content, author, author_id, created_at, upvotes, downvotes, is_concept, grade, gallery, image_url, views, is_hidden FROM posts WHERE id = %s', (post_id,))
             p = c.fetchone()
             if not p:
                 return {"success": False, "msg": "글을 찾을 수 없습니다."}
-            c.execute('SELECT id, author, author_id, content, created_at, image_url, parent_id FROM comments WHERE post_id = %s ORDER BY id ASC', (post_id,))
+            # 📌 신고가 누적되어 숨김 처리된 글은 관리자만 열람할 수 있습니다.
+            if p[13] and not is_admin:
+                return {"success": False, "msg": "신고가 누적되어 숨김 처리된 글입니다. (관리자 검토 중)"}
+            # 📌 숨김 처리된 댓글도 관리자에게만 보입니다.
+            hidden_cond = '' if is_admin else ' AND is_hidden = 0'
+            c.execute(f'SELECT id, author, author_id, content, created_at, image_url, parent_id, is_hidden FROM comments WHERE post_id = %s{hidden_cond} ORDER BY id ASC', (post_id,))
             cms = c.fetchall()
         comments = []
         for cm in cms:
             try: c_date = datetime.strptime(cm[4], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
             except Exception: c_date = cm[4]
-            comments.append({"id": cm[0], "author": cm[1], "author_id": cm[2], "content": cm[3], "date": c_date, "image_url": cm[5], "parent_id": cm[6]})
+            comments.append({"id": cm[0], "author": cm[1], "author_id": cm[2], "content": cm[3], "date": c_date, "image_url": cm[5], "parent_id": cm[6], "is_hidden": cm[7]})
         try: p_date = datetime.strptime(p[5], "%Y-%m-%d %H:%M:%S").strftime("%Y.%m.%d %H:%M")
         except Exception: p_date = p[5]
         return {
             "success": True,
-            "post": {"id": p[0], "title": p[1], "content": p[2], "author": p[3], "author_id": p[4], "date": p_date, "upvotes": p[6], "downvotes": p[7], "is_concept": p[8], "grade": p[9], "gallery": p[10], "image_url": p[11], "views": p[12]},
+            "post": {"id": p[0], "title": p[1], "content": p[2], "author": p[3], "author_id": p[4], "date": p_date, "upvotes": p[6], "downvotes": p[7], "is_concept": p[8], "grade": p[9], "gallery": p[10], "image_url": p[11], "views": p[12], "is_hidden": p[13]},
             "comments": comments
         }
     except Exception as e:
@@ -428,6 +705,10 @@ def add_post_py(title, content, author, author_id, password, gallery, image_url=
             return {"success": False, "msg": "글쓰기는 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
         if gallery == 'admin_notice' and not is_admin and author_id != ADMIN_LOGIN_ID:
             return {"success": False, "msg": "관리자 채널은 관리자만 작성할 수 있습니다."}
+        # 📌 욕설/비하 표현 필터 - 확실한 건 차단, 애매한 건 등록 후 관리자 검수 요청
+        level, bad_word = check_text_policy(f"{title}\n{content}")
+        if level == 'block':
+            return {"success": False, "msg": PROFANITY_BLOCK_MSG}
         # 📌 도배(글 테러) 방지: 관리자가 아니면 계정당 10분에 최대 7개까지만 글 작성 가능
         if not is_admin and author_id != ADMIN_LOGIN_ID:
             with db_cursor() as c:
@@ -450,6 +731,11 @@ def add_post_py(title, content, author, author_id, password, gallery, image_url=
                 VALUES (%s, %s, %s, %s, %s, %s, 0, 0, 0, %s, %s, %s)
             ''', (title.strip(), content.strip(), author or "ㅇㅇ", author_id or "101", password or "1234",
                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"), grade_val, gallery or "all", image_url))
+            if level == 'review':
+                c.execute('SELECT id FROM posts WHERE author_id = %s ORDER BY id DESC LIMIT 1', (author_id or "101",))
+                new_row = c.fetchone()
+                if new_row:
+                    _record_auto_flag(c, '게시글', new_row[0], bad_word)
         return {"success": True}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -458,6 +744,10 @@ def add_post_py(title, content, author, author_id, password, gallery, image_url=
 def edit_post_py(post_id, title, content, author_id, image_url='', is_admin=False):
     try:
         if not title or not content: return {"success": False, "msg": "제목과 내용을 입력하세요."}
+        # 📌 수정으로 욕설을 넣는 우회를 막기 위해 수정 시에도 동일하게 검사합니다.
+        level, bad_word = check_text_policy(f"{title}\n{content}")
+        if level == 'block':
+            return {"success": False, "msg": PROFANITY_BLOCK_MSG}
         with db_cursor(commit=True) as c:
             c.execute('SELECT author_id FROM posts WHERE id = %s', (post_id,))
             row = c.fetchone()
@@ -469,6 +759,8 @@ def edit_post_py(post_id, title, content, author_id, image_url='', is_admin=Fals
                 c.execute('UPDATE posts SET title = %s, content = %s, image_url = %s WHERE id = %s', (title.strip(), content.strip(), image_url, post_id))
             else:
                 c.execute('UPDATE posts SET title = %s, content = %s WHERE id = %s', (title.strip(), content.strip(), post_id))
+            if level == 'review':
+                _record_auto_flag(c, '게시글', post_id, bad_word)
         return {"success": True, "msg": "게시글이 수정되었습니다."}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -482,9 +774,9 @@ def get_posts_by_ids_py(id_list):
         with db_cursor() as c:
             c.execute(f"""
                 SELECT id, title, author, author_id, created_at,
-                       (SELECT COUNT(*) FROM comments WHERE post_id = posts.id) AS comment_count,
+                       (SELECT COUNT(*) FROM comments WHERE post_id = posts.id AND is_hidden = 0) AS comment_count,
                        upvotes, is_concept, grade, gallery, image_url
-                FROM posts WHERE id IN ({placeholders}) ORDER BY id DESC
+                FROM posts WHERE id IN ({placeholders}) AND is_hidden = 0 ORDER BY id DESC
             """, id_list)
             rows = c.fetchall()
         posts = []
@@ -521,6 +813,7 @@ def set_ad_banner_py(slot, image_url, author_id, is_admin=False):
                 INSERT INTO settings (key, value) VALUES (%s, %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             ''', (f'ad_banner_{slot}', image_url))
+            _write_admin_log(c, author_id, '광고 배너 변경', '광고란', slot, '이미지 등록/교체')
         return {"success": True, "msg": f"광고란 {slot}에 이미지가 등록되었습니다."}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -532,14 +825,29 @@ def delete_post_py(post_id, author_id='', is_admin=False):
     #    "작성자 본인 또는 관리자"만 가능하도록 소유권으로 검사합니다.
     try:
         with db_cursor(commit=True) as c:
-            c.execute('SELECT author_id FROM posts WHERE id = %s', (post_id,))
+            c.execute('SELECT id, author_id, author, title, content, gallery, created_at FROM posts WHERE id = %s', (post_id,))
             row = c.fetchone()
             if not row:
                 return {"success": False, "msg": "게시글이 존재하지 않습니다."}
-            if row[0] != author_id and not is_admin and author_id != ADMIN_LOGIN_ID:
+            if row[1] != author_id and not is_admin and author_id != ADMIN_LOGIN_ID:
                 return {"success": False, "msg": "본인이 작성한 글만 삭제할 수 있습니다."}
+            # 📌 데이터 보존 정책: 삭제된 글/댓글 원문을 보존 기간 동안만 따로 보관합니다.
+            #    (학폭 등 사안 조사 시 증거 확보 목적. 기간이 지나면 자동 파기됩니다.)
+            _archive_deleted(c, '게시글', {
+                "id": row[0], "author_id": row[1], "author": row[2], "title": row[3],
+                "content": row[4], "gallery": row[5], "created_at": row[6],
+            }, author_id, '작성자 삭제' if not is_admin else '관리자 삭제')
+            c.execute('SELECT id, post_id, author_id, author, content, created_at FROM comments WHERE post_id = %s', (post_id,))
+            for cm in c.fetchall():
+                _archive_deleted(c, '댓글', {
+                    "id": cm[0], "post_id": cm[1], "author_id": cm[2], "author": cm[3],
+                    "content": cm[4], "created_at": cm[5],
+                }, author_id, '원글 삭제에 따른 동반 삭제')
             c.execute('DELETE FROM posts WHERE id = %s', (post_id,))
             c.execute('DELETE FROM comments WHERE post_id = %s', (post_id,))
+            if is_admin or author_id == ADMIN_LOGIN_ID:
+                _write_admin_log(c, author_id, '게시글 삭제', '게시글', post_id, f'제목: {(row[3] or "")[:80]}')
+            _purge_expired_archive(c)
             msg = "[👑 관리자 권한] 게시글 삭제 완료." if is_admin else "게시글이 삭제되었습니다."
             return {"success": True, "msg": msg}
     except Exception as e:
@@ -554,7 +862,7 @@ def _maybe_mark_concept(c, post_id):
     if not row or row[2] == 1:
         return
     upvotes, downvotes = row[0], row[1]
-    c.execute('SELECT COUNT(*) FROM comments WHERE post_id = %s', (post_id,))
+    c.execute('SELECT COUNT(*) FROM comments WHERE post_id = %s AND is_hidden = 0', (post_id,))
     comment_count = c.fetchone()[0]
     if comment_count >= 5 or (upvotes - downvotes) >= 5:
         c.execute('UPDATE posts SET is_concept = 1 WHERE id = %s', (post_id,))
@@ -565,12 +873,22 @@ def add_comment_py(post_id, content, author, author_id, password, image_url='', 
         if not content and not image_url: return {"success": False, "msg": "내용이나 사진을 첨부하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "댓글 작성은 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
+        # 📌 댓글도 동일한 욕설/비하 필터를 거칩니다.
+        level, bad_word = check_text_policy(content)
+        if level == 'block':
+            return {"success": False, "msg": PROFANITY_BLOCK_MSG}
         with db_cursor(commit=True) as c:
             c.execute('''
                 INSERT INTO comments (post_id, content, author, author_id, password, created_at, image_url, parent_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ''', (post_id, content.strip(), author or "ㅇㅇ", author_id or "101", password or "1234",
                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"), image_url, parent_id))
+            if level == 'review':
+                c.execute('SELECT id FROM comments WHERE post_id = %s AND author_id = %s ORDER BY id DESC LIMIT 1',
+                          (post_id, author_id or "101"))
+                new_row = c.fetchone()
+                if new_row:
+                    _record_auto_flag(c, '댓글', new_row[0], bad_word)
             _maybe_mark_concept(c, post_id)
         return {"success": True}
     except Exception as e:
@@ -590,22 +908,88 @@ def vote_post_py(post_id, vote_type):
         return {"success": False, "msg": str(e)}
 
 
-def report_item_py(target_type, target_id, reason="사용자 신고"):
+def report_item_py(target_type, target_id, reason="사용자 신고", reporter_id=''):
+    hidden_now = False
     try:
         with db_cursor(commit=True) as c:
-            c.execute('INSERT INTO reports (target_type, target_id, reason, created_at) VALUES (%s, %s, %s, %s)',
-                      (target_type, target_id, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            c.execute('INSERT INTO reports (target_type, target_id, reason, created_at, reporter_id) VALUES (%s, %s, %s, %s, %s)',
+                      (target_type, target_id, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), reporter_id or ''))
+            # 📌 서로 다른 신고자가 기준치 이상 쌓이면 관리자가 확인하기 전이라도 즉시 비공개 처리합니다.
+            hidden_now = _maybe_auto_hide(c, target_type, target_id)
+    except Exception as e:
+        return {"success": True, "msg": f"신고 접수 중 오류가 발생했습니다. ({str(e)})"}
+    base_msg = "신고가 접수되어 관리자 이메일로 전송되었습니다."
+    if hidden_now:
+        base_msg = f"신고가 접수되었습니다. 신고가 {REPORT_HIDE_THRESHOLD}건 이상 누적되어 해당 글/댓글은 관리자 검토 전까지 자동으로 숨김 처리되었습니다."
+    try:
         report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         subject = f"[온리새롬 신고 접수] {target_type.upper()} 번호 #{target_id}"
         body = f"온리새롬 갤러리에 새로운 신고가 접수되었습니다.\n\n" \
                f"▪ 신고 대상: {target_type}\n" \
                f"▪ 대상 ID: {target_id}\n" \
                f"▪ 신고 사유: {reason}\n" \
-               f"▪ 접수 시각: {report_time}\n"
+               f"▪ 접수 시각: {report_time}\n" \
+               f"▪ 자동 숨김 여부: {'예 (신고 누적)' if hidden_now else '아니오'}\n"
         send_mail_via_brevo(ADMIN_EMAILS, subject, body)
-        return {"success": True, "msg": "신고가 접수되어 관리자 이메일로 전송되었습니다."}
+        return {"success": True, "msg": base_msg, "hidden": hidden_now}
     except Exception as e:
-        return {"success": True, "msg": f"신고 DB 접수 완료. (메일 발송 안내: {str(e)})"}
+        return {"success": True, "msg": f"{base_msg} (메일 발송 안내: {str(e)})", "hidden": hidden_now}
+
+
+def set_hidden_py(target_type, target_id, hidden, admin_id='', is_admin=False):
+    """📌 관리자가 숨김 처리된 글/댓글을 다시 공개하거나, 직접 숨길 수 있게 합니다."""
+    try:
+        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+            return {"success": False, "msg": "관리자만 사용할 수 있는 기능입니다."}
+        table = _target_table(target_type)
+        if not table or not target_id:
+            return {"success": False, "msg": "대상을 찾을 수 없습니다."}
+        new_val = 1 if hidden else 0
+        with db_cursor(commit=True) as c:
+            c.execute(f'SELECT id FROM {table} WHERE id = %s', (target_id,))
+            if not c.fetchone():
+                return {"success": False, "msg": "대상을 찾을 수 없습니다."}
+            c.execute(f'UPDATE {table} SET is_hidden = %s WHERE id = %s', (new_val, target_id))
+            _write_admin_log(c, admin_id, '숨김 처리' if new_val else '숨김 해제', target_type, target_id,
+                             '관리자 수동 처리')
+        return {"success": True, "msg": "숨김 처리했습니다." if new_val else "다시 공개했습니다."}
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+
+
+def get_admin_logs_py(admin_id='', is_admin=False, limit=50):
+    """📌 관리자 활동 로그 조회 (관리자 전용). 보존 기간이 지난 보관 자료도 이때 정리합니다."""
+    try:
+        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+            return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
+        try:
+            limit = max(1, min(int(limit), 200))
+        except Exception:
+            limit = 50
+        with db_cursor(commit=True) as c:
+            _purge_expired_archive(c)
+            c.execute(f'''
+                SELECT admin_id, action, target_type, target_id, detail, created_at
+                FROM admin_logs ORDER BY id DESC LIMIT {limit}
+            ''')
+            rows = c.fetchall()
+            c.execute('SELECT COUNT(*) FROM deleted_archive')
+            archive_row = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM posts WHERE is_hidden = 1")
+            hidden_posts = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM comments WHERE is_hidden = 1")
+            hidden_comments = c.fetchone()
+        logs = [{"admin_id": r[0], "action": r[1], "target_type": r[2], "target_id": r[3],
+                 "detail": r[4], "date": r[5]} for r in rows]
+        return {
+            "success": True, "logs": logs,
+            "archive_count": archive_row[0] if archive_row else 0,
+            "hidden_posts": hidden_posts[0] if hidden_posts else 0,
+            "hidden_comments": hidden_comments[0] if hidden_comments else 0,
+            "retention_days": DATA_RETENTION_DAYS,
+        }
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
 
 
 # ==========================================
@@ -654,7 +1038,10 @@ def api_send_email():
 @app.route('/api/create_account', methods=['POST'])
 def api_create_account():
     a = _args()
-    return jsonify(create_account_py(a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else ''))
+    return jsonify(create_account_py(
+        a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else '',
+        bool(a[2]) if len(a) > 2 else False, bool(a[3]) if len(a) > 3 else False
+    ))
 
 
 @app.route('/api/login', methods=['POST'])
@@ -682,7 +1069,8 @@ def api_get_posts():
         a[0] if len(a) > 0 else 'all',
         a[1] if len(a) > 1 else 'date',
         a[2] if len(a) > 2 else 'all',
-        a[3] if len(a) > 3 else ''
+        a[3] if len(a) > 3 else '',
+        bool(a[4]) if len(a) > 4 else False
     ))
 
 
@@ -694,7 +1082,10 @@ def api_get_home_summary():
 @app.route('/api/get_post_detail', methods=['POST'])
 def api_get_post_detail():
     a = _args()
-    return jsonify(get_post_detail_py(a[0] if len(a) > 0 else None, a[1] if len(a) > 1 else True))
+    return jsonify(get_post_detail_py(
+        a[0] if len(a) > 0 else None, a[1] if len(a) > 1 else True,
+        bool(a[2]) if len(a) > 2 else False
+    ))
 
 
 @app.route('/api/add_post', methods=['POST'])
@@ -761,7 +1152,29 @@ def api_vote_post():
 @app.route('/api/report_item', methods=['POST'])
 def api_report_item():
     a = _args()
-    return jsonify(report_item_py(a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else None, a[2] if len(a) > 2 else '사용자 신고'))
+    return jsonify(report_item_py(
+        a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else None,
+        a[2] if len(a) > 2 else '사용자 신고', a[3] if len(a) > 3 else ''
+    ))
+
+
+@app.route('/api/set_hidden', methods=['POST'])
+def api_set_hidden():
+    a = _args()
+    return jsonify(set_hidden_py(
+        a[0] if len(a) > 0 else '', a[1] if len(a) > 1 else None,
+        bool(a[2]) if len(a) > 2 else False, a[3] if len(a) > 3 else '',
+        bool(a[4]) if len(a) > 4 else False
+    ))
+
+
+@app.route('/api/get_admin_logs', methods=['POST'])
+def api_get_admin_logs():
+    a = _args()
+    return jsonify(get_admin_logs_py(
+        a[0] if len(a) > 0 else '', bool(a[1]) if len(a) > 1 else False,
+        a[2] if len(a) > 2 else 50
+    ))
 
 
 @app.route('/')
@@ -883,6 +1296,21 @@ HTML_PAGE = """
     /* 모달 모듈 (관리자 요청) */
     .modal-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
     .modal-box { background: #fff; border: 2px solid #534884; width: 320px; padding: 12px; border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }
+    /* 📌 정책 전문 / 관리자 로그처럼 내용이 긴 모달용 */
+    .modal-box-wide { width: 480px; max-width: 92vw; max-height: 82vh; display: flex; flex-direction: column; }
+    .modal-scroll { overflow-y: auto; font-size: 11px; line-height: 1.6; color: #333; padding-right: 4px; }
+    .modal-scroll h4 { font-size: 12px; color: #534884; margin: 10px 0 4px 0; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+    .modal-scroll ul { margin: 4px 0; padding-left: 16px; }
+    .modal-scroll li { margin-bottom: 3px; }
+    /* 📌 가입 시 필수 동의 영역 */
+    .consent-box { border: 1px solid #d1d1d1; background: #f8f9fa; border-radius: 3px; padding: 6px; margin-bottom: 4px; font-size: 10px; }
+    .consent-box label { display: flex; align-items: flex-start; gap: 4px; margin-bottom: 3px; cursor: pointer; line-height: 1.4; }
+    .consent-box input[type=checkbox] { margin: 1px 0 0 0; flex-shrink: 0; }
+    .policy-link { color: #534884; text-decoration: underline; cursor: pointer; font-size: 10px; font-weight: bold; }
+    .badge-hidden { background: #555; color: #fff; font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-right: 2px; font-weight: bold; }
+    .log-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    .log-table th { background: #f2f2f2; border-bottom: 1px solid #534884; padding: 4px 3px; text-align: left; white-space: nowrap; }
+    .log-table td { border-bottom: 1px solid #eee; padding: 4px 3px; color: #444; vertical-align: top; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -940,6 +1368,8 @@ HTML_PAGE = """
             <button id="btn-edit" class="dc-btn post-action-btn" style="background:#f0ad4e; display:none;" onclick="openEditBox()">✏️ 수정</button>
             <button id="btn-save" class="dc-btn post-action-btn" style="background:#95a5a6;" onclick="toggleSavePost()">☆ 저장</button>
             <button id="btn-delete" class="dc-btn post-action-btn dc-btn-delete" style="display:none;" onclick="deleteCurrentPost()">🗑️ 삭제</button>
+            <!-- 📌 관리자 전용: 글을 지우지 않고 비공개로만 돌립니다(원문 보존). -->
+            <button id="btn-hide" class="dc-btn post-action-btn" style="background:#555; display:none;" onclick="hideCurrentPost()">🙈 숨김</button>
             <button class="dc-btn post-action-btn dc-btn-danger" onclick="reportCurrentPost()">🚨 신고</button>
           </div>
         </div>
@@ -1095,6 +1525,14 @@ HTML_PAGE = """
           <div id="pw-set-step" class="hidden" style="margin-top: 4px;">
             <input type="password" class="full-input" id="new-pw" placeholder="사용할 비밀번호 (4자 이상)">
             <input type="password" class="full-input" id="new-pw-confirm" placeholder="비밀번호 확인">
+            <!-- 📌 개인정보 수집·이용 / 운영정책 필수 동의 -->
+            <div class="consent-box">
+              <label><input type="checkbox" id="agree-privacy"><span><b>[필수]</b> 개인정보 수집·이용에 동의합니다.</span></label>
+              <label><input type="checkbox" id="agree-terms"><span><b>[필수]</b> 운영정책(커뮤니티 이용규칙)에 동의합니다.</span></label>
+              <div style="text-align:right; margin-top:2px;">
+                <span class="policy-link" onclick="openPolicyModal()">정책 전문 보기 ▸</span>
+              </div>
+            </div>
             <button class="dc-btn" style="width:100%; background:#27ae60;" onclick="setAccountPassword()">계정 생성 완료</button>
           </div>
           <div id="auth-msg" style="font-size:9px; color:#e74c3c; margin-top:4px; word-break:break-all;"></div>
@@ -1117,6 +1555,11 @@ HTML_PAGE = """
       <div class="dc-box" style="border-color:#16a085;">
         <div class="dc-title" style="color:#16a085; border-color:#16a085;">✉️ 관리자 센터</div>
         <button class="dc-btn dc-btn-admin-req" onclick="openAdminReqModal()">관리자에게 요청하기</button>
+        <!-- 📌 관리자에게만 보이는 활동 로그 버튼 -->
+        <button id="btn-admin-log" class="dc-btn hidden" style="width:100%; background:#534884; margin-top:4px; font-size:11px; padding:6px;" onclick="openAdminLogModal()">🗂️ 관리자 활동 로그</button>
+        <div style="text-align:center; margin-top:6px;">
+          <span class="policy-link" onclick="openPolicyModal()">운영정책 · 개인정보 처리방침</span>
+        </div>
       </div>
       <!-- 📌 관리자 공지사항 -->
       <div class="dc-box" style="border-color:#f39c12;">
@@ -1162,6 +1605,71 @@ HTML_PAGE = """
       <button class="dc-btn" style="flex:1; background:#16a085;" onclick="submitAdminReq()">전송하기</button>
       <button class="dc-btn" style="flex:1; background:#7f8c8d;" onclick="closeAdminReqModal()">취소</button>
     </div>
+  </div>
+</div>
+<!-- 📌 운영정책 / 개인정보 처리방침 / 데이터 보존 정책 전문 -->
+<div id="policy-modal" class="modal-backdrop hidden">
+  <div class="modal-box modal-box-wide">
+    <div class="dc-title">📄 운영정책 및 개인정보 처리방침</div>
+    <div class="modal-scroll">
+      <h4>1. 개인정보 수집 · 이용 동의</h4>
+      <ul>
+        <li><b>수집 항목</b> : 학번(학교 이메일), 비밀번호(암호화하여 저장), 작성한 글·댓글 내용, 작성 시각</li>
+        <li><b>수집 목적</b> : 새롬고 재학생 본인 확인, 학년별 갤러리 접근 권한 부여, 부적절한 게시물 관리 및 이용자 보호</li>
+        <li><b>보유 기간</b> : 계정을 유지하는 동안 보관하며, 삭제된 글·댓글의 원문은 90일간 별도 보관 후 자동 파기됩니다.</li>
+        <li><b>제3자 제공</b> : 원칙적으로 외부에 제공하지 않습니다. 다만 <b>학교폭력 등 사안 조사를 위해 학교의 공식 요청이 있는 경우</b>, 해당 게시물과 작성자 학번을 학교에 제공할 수 있습니다.</li>
+        <li><b>동의 거부 권리</b> : 동의를 거부하실 수 있으나, 이 경우 계정 생성 및 글·댓글 작성이 제한됩니다. (글 열람은 가능)</li>
+      </ul>
+      <h4>2. 운영정책 (커뮤니티 이용규칙)</h4>
+      <ul>
+        <li><b>익명성의 한계</b> : 화면에는 익명으로 표시되지만, <b>모든 글과 댓글에는 작성자의 학번이 서버에 기록됩니다.</b> 완전한 익명이 아니며, 문제 발생 시 작성자를 확인할 수 있습니다.</li>
+        <li><b>금지 행위</b>
+          <ul>
+            <li>특정인을 지목한 비방·저격·조롱, 실명이나 학번 등 신상 공개</li>
+            <li>욕설, 혐오·차별 표현, 성적 수치심을 주는 내용</li>
+            <li>허위사실 유포, 도배, 무단 광고</li>
+          </ul>
+        </li>
+        <li><b>자동 조치</b>
+          <ul>
+            <li>욕설·비하 표현이 감지되면 등록 자체가 차단됩니다.</li>
+            <li><b>서로 다른 이용자 3명 이상이 신고하면 관리자 확인 전이라도 자동으로 비공개 처리</b>됩니다.</li>
+            <li>애매한 표현은 자동으로 관리자 검수 목록에 올라갑니다.</li>
+          </ul>
+        </li>
+        <li><b>제재 단계</b> : 1차 경고 및 게시물 삭제 → 2차 일정 기간 이용 제한 → 3차 이용 정지. 학교폭력에 해당하는 중대한 사안은 단계와 무관하게 즉시 학교에 통보합니다.</li>
+        <li><b>신고 방법</b> : 각 게시물과 댓글의 [신고] 버튼을 누르면 관리자에게 즉시 접수됩니다.</li>
+      </ul>
+      <h4>3. 데이터 보존 정책</h4>
+      <ul>
+        <li>삭제되거나 숨김 처리된 게시물·댓글의 원문은 <b>90일간 보관 후 자동으로 파기</b>됩니다. 이는 학교폭력 등 사안이 접수되었을 때 "삭제되어 증거가 사라지는" 상황을 막기 위한 것입니다.</li>
+        <li>관리자의 모든 조치(삭제·숨김·복구)는 <b>관리자 활동 로그</b>에 기록되어, 누가 언제 무엇을 처리했는지 확인할 수 있습니다.</li>
+        <li>보관된 자료는 사안 조사 및 이용자 보호 목적 외의 용도로 사용하지 않습니다.</li>
+      </ul>
+      <h4>4. 운영 주체 및 문의</h4>
+      <ul>
+        <li>본 서비스는 학생이 자율적으로 운영하는 교내 커뮤니티이며, 문의 및 신고는 사이드바의 [관리자에게 요청하기]를 통해 접수됩니다.</li>
+      </ul>
+    </div>
+    <button class="dc-btn" style="width:100%; margin-top:8px; background:#7f8c8d;" onclick="closePolicyModal()">닫기</button>
+  </div>
+</div>
+<!-- 📌 관리자 활동 로그 (관리자 전용) -->
+<div id="admin-log-modal" class="modal-backdrop hidden">
+  <div class="modal-box modal-box-wide">
+    <div class="dc-title">🗂️ 관리자 활동 로그</div>
+    <div id="admin-log-summary" style="font-size:10px; color:#666; margin-bottom:6px;"></div>
+    <div class="modal-scroll">
+      <table class="log-table">
+        <thead>
+          <tr><th>시각</th><th>처리자</th><th>조치</th><th>대상</th><th>비고</th></tr>
+        </thead>
+        <tbody id="admin-log-body">
+          <tr><td colspan="5" style="color:#888; padding:10px;">불러오는 중...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <button class="dc-btn" style="width:100%; margin-top:8px; background:#7f8c8d;" onclick="closeAdminLogModal()">닫기</button>
   </div>
 </div>
 <script>
@@ -1212,6 +1720,10 @@ HTML_PAGE = """
   }
   function isLoggedIn() {
     return !!localStorage.getItem('saerom_student_id');
+  }
+  // 📌 관리자 여부 (숨김 처리된 글 열람 / 활동 로그 조회에 사용)
+  function amIAdmin() {
+    return localStorage.getItem('saerom_is_admin') === 'true';
   }
   function getMyUserId() {
     const sid = localStorage.getItem('saerom_student_id');
@@ -1268,7 +1780,14 @@ HTML_PAGE = """
     const msgDiv = document.getElementById('auth-msg');
     if (!pw1 || pw1.length < 4) { alert("비밀번호는 4자 이상 입력해주세요."); return; }
     if (pw1 !== pw2) { alert("비밀번호가 일치하지 않습니다."); return; }
-    google.colab.kernel.invokeFunction('notebook.create_account', [email, pw1], {}).then(obj => {
+    // 📌 개인정보 수집·이용 / 운영정책 동의는 필수입니다.
+    const agreePrivacy = document.getElementById('agree-privacy').checked;
+    const agreeTerms = document.getElementById('agree-terms').checked;
+    if (!agreePrivacy || !agreeTerms) {
+      alert("개인정보 수집·이용 및 운영정책에 모두 동의해야 계정을 만들 수 있습니다.\\n[정책 전문 보기]에서 내용을 확인할 수 있습니다.");
+      return;
+    }
+    google.colab.kernel.invokeFunction('notebook.create_account', [email, pw1, agreePrivacy, agreeTerms], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
         const studentId = email.split('@')[0];
@@ -1374,6 +1893,63 @@ HTML_PAGE = """
     setAdAdminUploadVisible(false);
     const targetGallery = ['g1', 'g2', 'g3'].includes(currentGallery) ? 'home' : currentGallery;
     switchGallery(targetGallery);
+  }
+  // 📌 운영정책 / 개인정보 처리방침 전문 모달
+  function openPolicyModal() {
+    document.getElementById('policy-modal').classList.remove('hidden');
+  }
+  function closePolicyModal() {
+    document.getElementById('policy-modal').classList.add('hidden');
+  }
+  // 📌 관리자 활동 로그 모달 (관리자 전용)
+  function openAdminLogModal() {
+    if (!amIAdmin()) { alert("관리자만 조회할 수 있습니다."); return; }
+    document.getElementById('admin-log-modal').classList.remove('hidden');
+    loadAdminLogs();
+  }
+  function closeAdminLogModal() {
+    document.getElementById('admin-log-modal').classList.add('hidden');
+  }
+  function loadAdminLogs() {
+    const body = document.getElementById('admin-log-body');
+    const summary = document.getElementById('admin-log-summary');
+    body.innerHTML = '<tr><td colspan="5" style="color:#888; padding:10px;">불러오는 중...</td></tr>';
+    google.colab.kernel.invokeFunction('notebook.get_admin_logs', [getMyUserId(), amIAdmin(), 100], {}).then(obj => {
+      const res = parseRes(obj);
+      if (!res.success) {
+        body.innerHTML = `<tr><td colspan="5" style="color:#e74c3c; padding:10px;">${escapeHtml(res.msg || '불러오지 못했습니다.')}</td></tr>`;
+        return;
+      }
+      summary.innerHTML = `현재 숨김: 게시글 ${res.hidden_posts}건 / 댓글 ${res.hidden_comments}건 &nbsp;|&nbsp; 삭제 보관 자료 ${res.archive_count}건 (보존 ${res.retention_days}일 후 자동 파기)`;
+      if (!res.logs.length) {
+        body.innerHTML = '<tr><td colspan="5" style="color:#888; padding:10px;">기록이 없습니다.</td></tr>';
+        return;
+      }
+      body.innerHTML = '';
+      res.logs.forEach(l => {
+        body.innerHTML += `<tr>
+          <td style="white-space:nowrap;">${escapeHtml(l.date || '')}</td>
+          <td>${escapeHtml(l.admin_id || '')}</td>
+          <td>${escapeHtml(l.action || '')}</td>
+          <td>${escapeHtml(l.target_type || '')}${l.target_id ? ' #' + l.target_id : ''}</td>
+          <td>${escapeHtml(l.detail || '')}</td>
+        </tr>`;
+      });
+    });
+  }
+  // 📌 관리자가 숨김 처리된 글/댓글을 다시 공개하거나 직접 숨길 때 사용합니다.
+  function toggleHidden(targetType, targetId, hidden) {
+    if (!amIAdmin()) { alert("관리자만 사용할 수 있는 기능입니다."); return; }
+    const label = hidden ? '숨김 처리' : '공개';
+    if (!confirm(`이 ${targetType}을(를) ${label}하시겠습니까?`)) return;
+    google.colab.kernel.invokeFunction('notebook.set_hidden', [targetType, targetId, hidden, getMyUserId(), true], {}).then(obj => {
+      const res = parseRes(obj);
+      alert(res.msg || '처리되었습니다.');
+      if (res.success) {
+        if (currentPostId) viewPost(currentPostId);
+        else loadPosts();
+      }
+    });
   }
   function openAdminReqModal() {
     document.getElementById('admin-req-modal').classList.remove('hidden');
@@ -1584,6 +2160,8 @@ HTML_PAGE = """
       const imgBadge = post.has_image ? ' 📷' : '';
       let gBadge = `<span class="badge-gal">${galNames[post.gallery] || '기타'}</span>`;
       if (post.gallery === 'admin_notice') gBadge = `<span class="badge-admin">공지</span>`;
+      // 📌 숨김 처리된 글은 관리자에게만 목록에 보이며, [숨김] 표시가 붙습니다.
+      if (post.is_hidden) gBadge = `<span class="badge-hidden">숨김</span>` + gBadge;
       tr.innerHTML = `
         <td>${post.local_id}</td>
         <td class="title-td" onclick="viewPost(${post.id})">
@@ -1604,7 +2182,7 @@ HTML_PAGE = """
     const galType = (currentGallery === 'concept' || currentGallery === 'all') ? 'all_global' : currentGallery;
     const tbody = document.getElementById('post-list');
     if (!silent && tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#888; padding:15px;">불러오는 중...</td></tr>';
-    google.colab.kernel.invokeFunction('notebook.get_posts', [tabType, currentSort, galType, currentSearchKw], {}).then(obj => {
+    google.colab.kernel.invokeFunction('notebook.get_posts', [tabType, currentSort, galType, currentSearchKw, amIAdmin()], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) renderPostTable(res.posts);
       else if (!silent && tbody) tbody.innerHTML = '<tr><td colspan="4" style="color:#e74c3c; padding:15px;">불러오지 못했습니다. 새로고침 해주세요.</td></tr>';
@@ -1659,6 +2237,9 @@ HTML_PAGE = """
       const box = document.getElementById('ad-admin-upload-' + slot);
       if (box) box.classList.toggle('hidden', !isAdmin);
     });
+    // 📌 관리자 활동 로그 버튼도 관리자에게만 보입니다.
+    const logBtn = document.getElementById('btn-admin-log');
+    if (logBtn) logBtn.classList.toggle('hidden', !isAdmin);
   }
   function loadAdBanner(slot) {
     google.colab.kernel.invokeFunction('notebook.get_ad_banner', [slot], {}).then(obj => {
@@ -1773,14 +2354,23 @@ HTML_PAGE = """
     let imgHtml = cmt.image_url ? `<img src="${cmt.image_url}" class="comment-img">` : '';
     let writerBadge = (postAuthorId && cmt.author_id === postAuthorId) ? '<span class="badge-writer">글쓴이</span> ' : '';
     let replyBtn = isReply ? '' : `<button class="dc-btn btn-compact" onclick="toggleReplyForm(${cmt.id})" style="margin-right:2px;">답글</button>`;
-    return `<div class="comment-item${isReply ? ' comment-reply-item' : ''}">
+    // 📌 숨김 처리된 댓글은 관리자에게만 보이고, [숨김] 표시와 함께 복구 버튼이 붙습니다.
+    let hiddenBadge = cmt.is_hidden ? '<span class="badge-hidden">숨김</span> ' : '';
+    let adminBtn = '';
+    if (amIAdmin()) {
+      adminBtn = cmt.is_hidden
+        ? `<button class="dc-btn btn-compact" style="background:#27ae60; margin-right:2px;" onclick="toggleHidden('댓글', ${cmt.id}, false)">공개</button>`
+        : `<button class="dc-btn dc-btn-delete btn-compact" style="margin-right:2px;" onclick="toggleHidden('댓글', ${cmt.id}, true)">숨김</button>`;
+    }
+    return `<div class="comment-item${isReply ? ' comment-reply-item' : ''}"${cmt.is_hidden ? ' style="opacity:0.6;"' : ''}>
         <div style="flex:1; padding-right:6px;">
-          <div>${writerBadge}<b>${escapeHtml(cmt.author)}</b><span class="user-id">(${displayAuthorId(cmt.author_id)})</span> <span style="font-size:9px; color:#999;">${cmt.date}</span></div>
+          <div>${hiddenBadge}${writerBadge}<b>${escapeHtml(cmt.author)}</b><span class="user-id">(${displayAuthorId(cmt.author_id)})</span> <span style="font-size:9px; color:#999;">${cmt.date}</span></div>
           <div class="comment-body">${escapeHtml(cmt.content)}</div>
           ${imgHtml}
         </div>
         <div style="flex-shrink:0; display:flex; align-items:flex-start;">
           ${replyBtn}
+          ${adminBtn}
           <button class="dc-btn dc-btn-danger btn-compact" onclick="reportComment(${cmt.id})">신고</button>
         </div>
       </div>`;
@@ -1849,7 +2439,7 @@ HTML_PAGE = """
     stopDetailPolling();
     detailPollTimer = setInterval(() => {
       if (!currentPostId) return;
-      google.colab.kernel.invokeFunction('notebook.get_post_detail', [currentPostId, false], {}).then(obj => {
+      google.colab.kernel.invokeFunction('notebook.get_post_detail', [currentPostId, false, amIAdmin()], {}).then(obj => {
         const res = parseRes(obj);
         if (!res.success || !currentPostId) return;
         const p = res.post;
@@ -1894,7 +2484,7 @@ HTML_PAGE = """
     const contentAreaEarly = document.querySelector('.dc-content');
     if (contentAreaEarly) contentAreaEarly.scrollTop = 0;
     document.getElementById('post-view-box').scrollIntoView({ block: 'start' });
-    google.colab.kernel.invokeFunction('notebook.get_post_detail', [postId, true], {}).then(obj => {
+    google.colab.kernel.invokeFunction('notebook.get_post_detail', [postId, true, amIAdmin()], {}).then(obj => {
       const res = parseRes(obj);
       if (res.success) {
         const p = res.post;
@@ -1905,9 +2495,17 @@ HTML_PAGE = """
         let tagHtml = `<span class="badge-gal">${galNames[p.gallery] || '기타'}</span> `;
         if (p.gallery === 'admin_notice') tagHtml = `<span class="badge-admin">공지</span> `;
         if (p.is_concept) tagHtml += `<span class="badge-concept">인기</span> `;
+        // 📌 숨김 처리된 글(관리자만 열람 가능)에는 [숨김] 표시와 복구 버튼을 붙입니다.
+        if (p.is_hidden) tagHtml = `<span class="badge-hidden">숨김</span> ` + tagHtml;
         document.getElementById('view-title').innerHTML = tagHtml + escapeHtml(p.title);
+        const hiddenNoticeHtml = p.is_hidden
+          ? `<div style="background:#fff3cd; border:1px solid #f39c12; color:#7a5200; font-size:10px; padding:5px 6px; border-radius:3px; margin:4px 0;">
+               신고가 누적되어 <b>일반 이용자에게는 보이지 않는 상태</b>입니다. 검토 후 문제가 없으면 다시 공개할 수 있습니다.
+               <button class="dc-btn btn-compact" style="background:#27ae60; margin-left:4px;" onclick="toggleHidden('게시글', ${p.id}, false)">다시 공개</button>
+             </div>` : '';
         document.getElementById('view-meta').innerText = `${p.author}(${displayAuthorId(p.author_id)}) | ${p.date} | 조회 ${p.views}`;
-        document.getElementById('view-content').innerText = p.content;
+        document.getElementById('view-content').innerHTML = hiddenNoticeHtml;
+        document.getElementById('view-content').appendChild(document.createTextNode(p.content));
         const imgBox = document.getElementById('view-image-container');
         imgBox.innerHTML = p.image_url ? `<img src="${p.image_url}" class="post-img">` : '';
         document.getElementById('up-count').innerText = p.upvotes;
@@ -1923,6 +2521,9 @@ HTML_PAGE = """
         // 📌 삭제도 수정과 동일하게 "본인 글 또는 관리자"만 버튼이 보이도록 합니다.
         const deleteBtn = document.getElementById('btn-delete');
         if (deleteBtn) deleteBtn.style.display = canEdit ? 'inline-block' : 'none';
+        // 📌 숨김 버튼은 관리자에게만, 그리고 아직 숨겨지지 않은 글에만 보입니다.
+        const hideBtn = document.getElementById('btn-hide');
+        if (hideBtn) hideBtn.style.display = (isAdminNow && !p.is_hidden) ? 'inline-block' : 'none';
         refreshSaveButton();
         document.getElementById('post-view-box').classList.remove('hidden');
         // 📌 detail 영역이 항상 목록 위쪽에 있으므로, 목록에서 다른 글을 눌렀을 때도
@@ -1989,21 +2590,32 @@ HTML_PAGE = """
       }
     }).catch(() => { if (callback) callback(); });
   }
+  // 📌 신고 시 신고자 학번을 함께 보냅니다. 서로 다른 신고자 3명 이상이 모이면
+  //    관리자 확인 전이라도 자동으로 숨김 처리됩니다(같은 사람이 여러 번 신고해도 1명으로 계산).
+  // 📌 관리자가 글을 삭제하지 않고 비공개로만 돌립니다 (원문은 그대로 남습니다).
+  function hideCurrentPost() {
+    if (!currentPostId) return;
+    toggleHidden('게시글', currentPostId, true);
+  }
   function reportCurrentPost() {
     if (!currentPostId) return;
+    if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
     const reason = prompt("게시글 신고 사유를 입력하세요:");
     if (!reason || !reason.trim()) return;
-    google.colab.kernel.invokeFunction('notebook.report_item', ['게시글', currentPostId, reason.trim()], {}).then(obj => {
+    google.colab.kernel.invokeFunction('notebook.report_item', ['게시글', currentPostId, reason.trim(), getMyUserId()], {}).then(obj => {
       const res = parseRes(obj);
       alert(res.msg || "신고가 접수되었습니다.");
+      if (res.hidden) closeView();
     });
   }
   function reportComment(commentId) {
+    if (!isLoggedIn()) { alert("신고는 로그인 후 이용 가능합니다."); return; }
     const reason = prompt("댓글 신고 사유를 입력하세요:");
     if (!reason || !reason.trim()) return;
-    google.colab.kernel.invokeFunction('notebook.report_item', ['댓글', commentId, reason.trim()], {}).then(obj => {
+    google.colab.kernel.invokeFunction('notebook.report_item', ['댓글', commentId, reason.trim(), getMyUserId()], {}).then(obj => {
       const res = parseRes(obj);
       alert(res.msg || "신고가 접수되었습니다.");
+      if (res.hidden && currentPostId) viewPost(currentPostId);
     });
   }
   function closeView() {
