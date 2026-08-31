@@ -35,6 +35,48 @@ ADMIN_EMAILS = [e.strip() for e in os.environ.get(
 TEACHER_EMAILS = [e.strip() for e in os.environ.get("TEACHER_EMAILS", "").split(",") if e.strip()]
 ADMIN_LOGIN_ID = os.environ.get("ADMIN_LOGIN_ID", "OSG_admin")
 ADMIN_LOGIN_PASSWORD = os.environ.get("ADMIN_LOGIN_PASSWORD", "qwerty4321!")
+
+# 📌 관리자 계정을 사람별로 분리합니다.
+#    예전에는 관리자 로그인이 ADMIN_LOGIN_ID/PASSWORD 하나뿐이라, 학생회 담당자·교사·
+#    개발자가 전부 같은 계정으로 로그인했습니다. 그러면 관리자 활동 로그를 봐도
+#    "누가" 숨김 처리/제재를 했는지 구분이 안 되어, 정작 로그의 목적(투명한 관리 소명)이
+#    무색해집니다. 이제는 Render 환경변수 ADMIN_ACCOUNTS에 사람별 로그인 정보를
+#    "아이디:비밀번호:표시이름" 형식으로 쉼표 구분해서 여러 명 등록할 수 있습니다.
+#    예) ADMIN_ACCOUNTS="council_kim:pw1:학생회 김OO,teacher_lee:pw2:지도교사 이OO,dev_admin:pw3:개발자"
+#    ADMIN_ACCOUNTS를 설정하지 않으면 예전처럼 ADMIN_LOGIN_ID/PASSWORD 하나만 동작합니다(하위 호환).
+def _parse_admin_accounts():
+    accounts = {}
+    raw = os.environ.get("ADMIN_ACCOUNTS", "")
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) < 2:
+            continue
+        aid, pw = parts[0].strip(), parts[1].strip()
+        label = parts[2].strip() if len(parts) > 2 and parts[2].strip() else aid
+        if aid and pw:
+            accounts[aid] = {"password": pw, "label": label}
+    if not accounts:
+        accounts[ADMIN_LOGIN_ID] = {"password": ADMIN_LOGIN_PASSWORD, "label": ADMIN_LOGIN_ID}
+    return accounts
+
+
+ADMIN_ACCOUNTS = _parse_admin_accounts()
+
+
+def _check_admin_login(admin_id, password):
+    acc = ADMIN_ACCOUNTS.get((admin_id or '').strip())
+    return bool(acc and acc["password"] == password)
+
+
+def _is_admin_id(admin_id):
+    """📌 예전 코드 곳곳의 'admin_id != ADMIN_LOGIN_ID' 검사를 대체합니다.
+    등록된 관리자 계정 중 누구든(학생회/교사/개발자 구분 없이) 통과합니다."""
+    return (admin_id or '') in ADMIN_ACCOUNTS
+
+
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onlysaerom1@gmail.com")
 SENDER_NAME = os.environ.get("SENDER_NAME", "온리새롬 갤러리")
@@ -484,7 +526,7 @@ def _hash_pw(password):
 
 
 def _is_verified_user(student_id):
-    if student_id == ADMIN_LOGIN_ID:
+    if _is_admin_id(student_id):
         return True
     try:
         with db_cursor() as c:
@@ -529,7 +571,7 @@ def apply_user_sanction_py(student_id, action, reason, admin_id, is_admin=False,
     """📌 관리자가 특정 학번에 대해 경고/일시정지/영구정지/해제 조치를 적용합니다.
     action: '경고' | '일시정지' | '영구정지' | '해제'"""
     try:
-        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(admin_id):
             return {"success": False, "msg": "관리자만 사용할 수 있는 기능입니다."}
         student_id = (student_id or '').strip()
         if not student_id:
@@ -568,7 +610,7 @@ def apply_user_sanction_py(student_id, action, reason, admin_id, is_admin=False,
 def get_user_sanction_status_py(student_id, admin_id, is_admin=False):
     """📌 관리자 패널에서 특정 학번의 현재 제재 상태를 조회합니다."""
     try:
-        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(admin_id):
             return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
         student_id = (student_id or '').strip()
         with db_cursor(commit=True) as c:
@@ -585,7 +627,7 @@ def get_user_sanction_status_py(student_id, admin_id, is_admin=False):
 def list_sanctioned_users_py(admin_id, is_admin=False):
     """📌 경고를 받았거나 현재 이용 제한 중인 계정 목록 (관리자 패널용)."""
     try:
-        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(admin_id):
             return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
         with db_cursor(commit=True) as c:
             c.execute('''
@@ -640,8 +682,9 @@ def create_account_py(email, password, agree_privacy=False, agree_terms=False):
 def login_py(student_id, password):
     try:
         student_id = (student_id or '').strip()
-        if student_id == ADMIN_LOGIN_ID and password == ADMIN_LOGIN_PASSWORD:
-            return {"success": True, "grade": "admin", "is_admin": True, "msg": "관리자로 로그인되었습니다."}
+        if _check_admin_login(student_id, password):
+            label = ADMIN_ACCOUNTS[student_id]["label"]
+            return {"success": True, "grade": "admin", "is_admin": True, "msg": f"관리자로 로그인되었습니다. ({label})"}
         with db_cursor(commit=True) as c:
             c.execute('SELECT password_hash, grade, is_admin FROM users WHERE student_id = %s', (student_id,))
             row = c.fetchone()
@@ -665,7 +708,7 @@ def login_py(student_id, password):
 def change_password_py(student_id, old_password, new_password):
     try:
         student_id = (student_id or '').strip()
-        if student_id == ADMIN_LOGIN_ID:
+        if _is_admin_id(student_id):
             return {"success": False, "msg": "관리자 계정은 비밀번호를 변경할 수 없습니다."}
         if not new_password or len(new_password) < 4:
             return {"success": False, "msg": "새 비밀번호는 4자 이상 입력해주세요."}
@@ -838,19 +881,19 @@ def add_post_py(title, content, author, author_id, password, gallery, image_url=
         if not title or not content: return {"success": False, "msg": "제목과 내용을 입력하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "글쓰기는 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
-        if not is_admin and author_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(author_id):
             with db_cursor(commit=True) as c:
                 sus = _check_suspension(c, author_id)
             if sus["suspended"]:
                 return {"success": False, "msg": _suspension_message(sus)}
-        if gallery == 'admin_notice' and not is_admin and author_id != ADMIN_LOGIN_ID:
+        if gallery == 'admin_notice' and not is_admin and not _is_admin_id(author_id):
             return {"success": False, "msg": "관리자 채널은 관리자만 작성할 수 있습니다."}
         # 📌 욕설/비하 표현 필터 - 확실한 건 차단, 애매한 건 등록 후 관리자 검수 요청
         level, bad_word = check_text_policy(f"{title}\n{content}")
         if level == 'block':
             return {"success": False, "msg": PROFANITY_BLOCK_MSG}
         # 📌 도배(글 테러) 방지: 관리자가 아니면 계정당 10분에 최대 7개까지만 글 작성 가능
-        if not is_admin and author_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(author_id):
             with db_cursor() as c:
                 c.execute('SELECT created_at FROM posts WHERE author_id = %s ORDER BY id DESC LIMIT 20', (author_id,))
                 recent_rows = c.fetchall()
@@ -893,7 +936,7 @@ def edit_post_py(post_id, title, content, author_id, image_url='', is_admin=Fals
             row = c.fetchone()
             if not row:
                 return {"success": False, "msg": "게시글이 존재하지 않습니다."}
-            if row[0] != author_id and not is_admin and author_id != ADMIN_LOGIN_ID:
+            if row[0] != author_id and not is_admin and not _is_admin_id(author_id):
                 return {"success": False, "msg": "본인이 작성한 글만 수정할 수 있습니다."}
             if image_url:
                 c.execute('UPDATE posts SET title = %s, content = %s, image_url = %s WHERE id = %s', (title.strip(), content.strip(), image_url, post_id))
@@ -946,7 +989,7 @@ def get_ad_banner_py(slot=1):
 
 def set_ad_banner_py(slot, image_url, author_id, is_admin=False):
     try:
-        if not is_admin and author_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(author_id):
             return {"success": False, "msg": "관리자만 광고 이미지를 등록할 수 있습니다."}
         with db_cursor(commit=True) as c:
             c.execute('''
@@ -969,7 +1012,7 @@ def delete_post_py(post_id, author_id='', is_admin=False):
             row = c.fetchone()
             if not row:
                 return {"success": False, "msg": "게시글이 존재하지 않습니다."}
-            if row[1] != author_id and not is_admin and author_id != ADMIN_LOGIN_ID:
+            if row[1] != author_id and not is_admin and not _is_admin_id(author_id):
                 return {"success": False, "msg": "본인이 작성한 글만 삭제할 수 있습니다."}
             # 📌 데이터 보존 정책: 삭제된 글/댓글 원문을 보존 기간 동안만 따로 보관합니다.
             #    (학폭 등 사안 조사 시 증거 확보 목적. 기간이 지나면 자동 파기됩니다.)
@@ -985,7 +1028,7 @@ def delete_post_py(post_id, author_id='', is_admin=False):
                 }, author_id, '원글 삭제에 따른 동반 삭제')
             c.execute('DELETE FROM posts WHERE id = %s', (post_id,))
             c.execute('DELETE FROM comments WHERE post_id = %s', (post_id,))
-            if is_admin or author_id == ADMIN_LOGIN_ID:
+            if is_admin or _is_admin_id(author_id):
                 _write_admin_log(c, author_id, '게시글 삭제', '게시글', post_id, f'제목: {(row[3] or "")[:80]}')
             _purge_expired_archive(c)
             msg = "[👑 관리자 권한] 게시글 삭제 완료." if is_admin else "게시글이 삭제되었습니다."
@@ -1013,7 +1056,7 @@ def add_comment_py(post_id, content, author, author_id, password, image_url='', 
         if not content and not image_url: return {"success": False, "msg": "내용이나 사진을 첨부하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "댓글 작성은 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
-        if author_id != ADMIN_LOGIN_ID:
+        if not _is_admin_id(author_id):
             with db_cursor(commit=True) as c:
                 sus = _check_suspension(c, author_id)
             if sus["suspended"]:
@@ -1092,7 +1135,7 @@ def report_item_py(target_type, target_id, reason="사용자 신고", reporter_i
 def set_hidden_py(target_type, target_id, hidden, admin_id='', is_admin=False):
     """📌 관리자가 숨김 처리된 글/댓글을 다시 공개하거나, 직접 숨길 수 있게 합니다."""
     try:
-        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(admin_id):
             return {"success": False, "msg": "관리자만 사용할 수 있는 기능입니다."}
         table = _target_table(target_type)
         if not table or not target_id:
@@ -1113,7 +1156,7 @@ def set_hidden_py(target_type, target_id, hidden, admin_id='', is_admin=False):
 def get_admin_logs_py(admin_id='', is_admin=False, limit=50):
     """📌 관리자 활동 로그 조회 (관리자 전용). 보존 기간이 지난 보관 자료도 이때 정리합니다."""
     try:
-        if not is_admin and admin_id != ADMIN_LOGIN_ID:
+        if not is_admin and not _is_admin_id(admin_id):
             return {"success": False, "msg": "관리자만 조회할 수 있습니다."}
         try:
             limit = max(1, min(int(limit), 200))
