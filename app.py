@@ -158,7 +158,8 @@ def init_db():
                               ("grade", "TEXT DEFAULT '1'"), ("gallery", "TEXT DEFAULT 'all'"),
                               ("image_url", "TEXT DEFAULT ''"), ("views", "INTEGER DEFAULT 0")]:
             c.execute(f"ALTER TABLE posts ADD COLUMN IF NOT EXISTS {col} {coltype}")
-        for col, coltype in [("author_id", "TEXT DEFAULT '101'"), ("image_url", "TEXT DEFAULT ''")]:
+        for col, coltype in [("author_id", "TEXT DEFAULT '101'"), ("image_url", "TEXT DEFAULT ''"),
+                              ("parent_id", "INTEGER DEFAULT NULL")]:
             c.execute(f"ALTER TABLE comments ADD COLUMN IF NOT EXISTS {col} {coltype}")
         # 📌 관리자 권한은 이메일 인증 계정이 아닌 별도의 관리자 로그인(ADMIN_LOGIN_ID)으로만 부여됩니다.
         c.execute("UPDATE users SET is_admin = 0")
@@ -402,13 +403,13 @@ def get_post_detail_py(post_id, increment_view=True):
             p = c.fetchone()
             if not p:
                 return {"success": False, "msg": "글을 찾을 수 없습니다."}
-            c.execute('SELECT id, author, author_id, content, created_at, image_url FROM comments WHERE post_id = %s ORDER BY id ASC', (post_id,))
+            c.execute('SELECT id, author, author_id, content, created_at, image_url, parent_id FROM comments WHERE post_id = %s ORDER BY id ASC', (post_id,))
             cms = c.fetchall()
         comments = []
         for cm in cms:
             try: c_date = datetime.strptime(cm[4], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
             except Exception: c_date = cm[4]
-            comments.append({"id": cm[0], "author": cm[1], "author_id": cm[2], "content": cm[3], "date": c_date, "image_url": cm[5]})
+            comments.append({"id": cm[0], "author": cm[1], "author_id": cm[2], "content": cm[3], "date": c_date, "image_url": cm[5], "parent_id": cm[6]})
         try: p_date = datetime.strptime(p[5], "%Y-%m-%d %H:%M:%S").strftime("%Y.%m.%d %H:%M")
         except Exception: p_date = p[5]
         return {
@@ -545,17 +546,32 @@ def delete_post_py(post_id, author_id='', is_admin=False):
         return {"success": False, "msg": str(e)}
 
 
-def add_comment_py(post_id, content, author, author_id, password, image_url=''):
+def _maybe_mark_concept(c, post_id):
+    """📌 인기글(개념글) 승격 조건: 댓글이 5개 이상이거나, (추천 - 비추천)이 5 이상이면
+    인기글로 표시합니다. 한번 인기글이 되면 계속 유지합니다(강등 없음)."""
+    c.execute('SELECT upvotes, downvotes, is_concept FROM posts WHERE id = %s', (post_id,))
+    row = c.fetchone()
+    if not row or row[2] == 1:
+        return
+    upvotes, downvotes = row[0], row[1]
+    c.execute('SELECT COUNT(*) FROM comments WHERE post_id = %s', (post_id,))
+    comment_count = c.fetchone()[0]
+    if comment_count >= 5 or (upvotes - downvotes) >= 5:
+        c.execute('UPDATE posts SET is_concept = 1 WHERE id = %s', (post_id,))
+
+
+def add_comment_py(post_id, content, author, author_id, password, image_url='', parent_id=None):
     try:
         if not content and not image_url: return {"success": False, "msg": "내용이나 사진을 첨부하세요."}
         if not _is_verified_user(author_id):
             return {"success": False, "msg": "댓글 작성은 로그인 후 이용 가능합니다. 학번 인증으로 계정을 만들고 로그인해주세요."}
         with db_cursor(commit=True) as c:
             c.execute('''
-                INSERT INTO comments (post_id, content, author, author_id, password, created_at, image_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO comments (post_id, content, author, author_id, password, created_at, image_url, parent_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ''', (post_id, content.strip(), author or "ㅇㅇ", author_id or "101", password or "1234",
-                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), image_url))
+                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), image_url, parent_id))
+            _maybe_mark_concept(c, post_id)
         return {"success": True}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -565,19 +581,10 @@ def vote_post_py(post_id, vote_type):
     try:
         with db_cursor(commit=True) as c:
             if vote_type == 'up':
-                c.execute('SELECT created_at, upvotes, is_concept FROM posts WHERE id = %s', (post_id,))
-                row = c.fetchone()
-                if row:
-                    new_up, is_concept = row[1] + 1, row[2]
-                    new_is_concept = is_concept
-                    if is_concept == 0 and new_up >= 10:
-                        try:
-                            if (datetime.now() - datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")).total_seconds() <= 600:
-                                new_is_concept = 1
-                        except Exception: new_is_concept = 1
-                    c.execute('UPDATE posts SET upvotes = upvotes + 1, is_concept = %s WHERE id = %s', (new_is_concept, post_id))
+                c.execute('UPDATE posts SET upvotes = upvotes + 1 WHERE id = %s', (post_id,))
             elif vote_type == 'down':
                 c.execute('UPDATE posts SET downvotes = downvotes + 1 WHERE id = %s', (post_id,))
+            _maybe_mark_concept(c, post_id)
         return {"success": True}
     except Exception as e:
         return {"success": False, "msg": str(e)}
@@ -740,7 +747,8 @@ def api_add_comment():
     a = _args()
     return jsonify(add_comment_py(
         a[0] if len(a) > 0 else None, a[1] if len(a) > 1 else '', a[2] if len(a) > 2 else '',
-        a[3] if len(a) > 3 else '', a[4] if len(a) > 4 else '', a[5] if len(a) > 5 else ''
+        a[3] if len(a) > 3 else '', a[4] if len(a) > 4 else '', a[5] if len(a) > 5 else '',
+        a[6] if len(a) > 6 else None
     ))
 
 
@@ -860,6 +868,12 @@ HTML_PAGE = """
     .comment-item { border-bottom: 1px solid #e5e7eb; padding: 5px 0; font-size: 11px; display: flex; justify-content: space-between; line-height: 1.4; }
     .comment-body { word-break: keep-all; word-wrap: break-word; overflow-wrap: break-word; white-space: pre-wrap; margin-top: 2px; color: #333; }
     .comment-img { max-width: 100%; max-height: 120px; display: block; margin-top: 4px; border: 1px solid #ddd; }
+    /* 📌 대댓글(답글)은 원댓글 아래에 왼쪽 테두리로 들여쓰기 표시합니다. */
+    .comment-reply-list { margin-left: 18px; padding-left: 8px; border-left: 2px solid #e5e7eb; }
+    .comment-reply-item { border-bottom: 1px dashed #eee; padding: 4px 0; font-size: 10px; }
+    .badge-writer { background: #2ee6b5; color: #10352a; font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-right: 2px; font-weight: bold; }
+    .reply-form { margin: 4px 0 6px 18px; padding: 4px 6px; background: #f1f1f6; border-radius: 3px; }
+    .reply-form textarea { height: 34px; }
     .toolbar-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; }
     .search-box { display: flex; gap: 2px; flex: 1; }
     .search-input { width: 100%; padding: 3px 6px; font-size: 10px; }
@@ -1753,22 +1767,78 @@ HTML_PAGE = """
     });
   }
   // 📌 댓글 목록 렌더링 (최초 진입 시 + 아래 실시간 자동 새로고침에서 공용으로 사용)
+  // 📌 댓글 하나를 그려주는 공통 함수 - 원댓글/대댓글 모두 이걸로 그립니다.
+  //    글쓴이(post.author_id)와 댓글 작성자가 같으면 "글쓴이" 배지를 붙입니다.
+  function renderCommentHtml(cmt, postAuthorId, isReply) {
+    let imgHtml = cmt.image_url ? `<img src="${cmt.image_url}" class="comment-img">` : '';
+    let writerBadge = (postAuthorId && cmt.author_id === postAuthorId) ? '<span class="badge-writer">글쓴이</span> ' : '';
+    let replyBtn = isReply ? '' : `<button class="dc-btn btn-compact" onclick="toggleReplyForm(${cmt.id})" style="margin-right:2px;">답글</button>`;
+    return `<div class="comment-item${isReply ? ' comment-reply-item' : ''}">
+        <div style="flex:1; padding-right:6px;">
+          <div>${writerBadge}<b>${escapeHtml(cmt.author)}</b><span class="user-id">(${displayAuthorId(cmt.author_id)})</span> <span style="font-size:9px; color:#999;">${cmt.date}</span></div>
+          <div class="comment-body">${escapeHtml(cmt.content)}</div>
+          ${imgHtml}
+        </div>
+        <div style="flex-shrink:0; display:flex; align-items:flex-start;">
+          ${replyBtn}
+          <button class="dc-btn dc-btn-danger btn-compact" onclick="reportComment(${cmt.id})">신고</button>
+        </div>
+      </div>`;
+  }
+  // 📌 대댓글은 1단계까지만 지원합니다 (답글에 또 답글을 달면 같은 원댓글 밑에 나란히 붙습니다).
+  //    parent_id가 없는 댓글이 원댓글, 있는 댓글은 그 원댓글의 답글로 묶어서 보여줍니다.
   function renderComments(comments) {
     const cmtList = document.getElementById('comment-list');
     if (!cmtList) return;
     cmtList.innerHTML = comments.length ? '' : '<div style="color:#888; padding:4px 0;">첫 댓글을 남겨보세요!</div>';
-    comments.forEach(cmt => {
-      let imgHtml = cmt.image_url ? `<img src="${cmt.image_url}" class="comment-img">` : '';
-      cmtList.innerHTML += `<div class="comment-item">
-        <div style="flex:1; padding-right:6px;">
-          <div><b>${escapeHtml(cmt.author)}</b><span class="user-id">(${displayAuthorId(cmt.author_id)})</span> <span style="font-size:9px; color:#999;">${cmt.date}</span></div>
-          <div class="comment-body">${escapeHtml(cmt.content)}</div>
-          ${imgHtml}
-        </div>
-        <div style="flex-shrink:0;">
-          <button class="dc-btn dc-btn-danger btn-compact" onclick="reportComment(${cmt.id})">신고</button>
+    const postAuthorId = currentPostData ? currentPostData.author_id : null;
+    const topLevel = comments.filter(c => !c.parent_id);
+    const repliesByParent = {};
+    comments.forEach(c => {
+      if (c.parent_id) {
+        const pid = c.parent_id;
+        (repliesByParent[pid] = repliesByParent[pid] || []).push(c);
+      }
+    });
+    topLevel.forEach(cmt => {
+      let html = renderCommentHtml(cmt, postAuthorId, false);
+      const replies = repliesByParent[cmt.id] || [];
+      if (replies.length) {
+        html += '<div class="comment-reply-list">';
+        replies.forEach(r => { html += renderCommentHtml(r, postAuthorId, true); });
+        html += '</div>';
+      }
+      html += `<div id="reply-form-${cmt.id}" class="reply-form hidden">
+        <input type="text" id="reply-author-${cmt.id}" class="full-input" placeholder="닉네임" value="ㅇㅇ" style="margin-bottom:3px;">
+        <textarea id="reply-content-${cmt.id}" placeholder="답글을 입력하세요..."></textarea>
+        <div style="display:flex; gap:4px;">
+          <button class="dc-btn btn-compact" onclick="submitReply(${cmt.id})">답글 등록</button>
+          <button class="dc-btn dc-btn-delete btn-compact" onclick="toggleReplyForm(${cmt.id})">취소</button>
         </div>
       </div>`;
+      cmtList.innerHTML += html;
+    });
+  }
+  function toggleReplyForm(commentId) {
+    if (!isLoggedIn()) { alert("답글 작성은 로그인 후 이용 가능합니다."); return; }
+    const el = document.getElementById(`reply-form-${commentId}`);
+    if (el) el.classList.toggle('hidden');
+  }
+  function submitReply(parentId) {
+    if (!currentPostId) return;
+    if (!isLoggedIn()) { alert("답글 작성은 로그인 후 이용 가능합니다."); return; }
+    const authorInput = document.getElementById(`reply-author-${parentId}`);
+    const contentInput = document.getElementById(`reply-content-${parentId}`);
+    const author = authorInput ? authorInput.value : 'ㅇㅇ';
+    const content = contentInput ? contentInput.value.trim() : '';
+    if (!content) { alert("답글 내용을 입력하세요."); return; }
+    google.colab.kernel.invokeFunction('notebook.add_comment', [currentPostId, content, author, getMyUserId(), '', '', parentId], {}).then(obj => {
+      const res = parseRes(obj);
+      if (res.success) {
+        viewPost(currentPostId);
+      } else {
+        alert(res.msg || "답글 등록에 실패했습니다.");
+      }
     });
   }
   // 📌 실시간 소통을 위한 자동 새로고침(폴링): 완전한 실시간 웹소켓 대신,
